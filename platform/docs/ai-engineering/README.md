@@ -1,6 +1,6 @@
 # AI Engineering
 
-Tài liệu thuộc phạm vi của AI Engineering cho TechX Corp Platform.
+Tài liệu thuộc phạm vi của AI Engineering cho Cloud-Native Platform.
 
 Team tập trung phát triển trải nghiệm mua sắm dùng LLM trên nền các service hiện có, trước mắt tại `src/product-reviews`. Phạm vi bao gồm grounding và citation, guardrails, product discovery, shopping copilot, controlled cart actions, evaluation, resilience và GenAI observability.
 

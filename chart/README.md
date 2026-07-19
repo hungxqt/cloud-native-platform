@@ -1,6 +1,6 @@
-# TechX Corp Platform - Helm Chart
+# Platform Helm Chart
 
-Helm chart to deploy the TechX Corp platform on Kubernetes: application
+Helm chart to deploy the cloud-native platform on Kubernetes: application
 microservices, AI review service + LLM, and the bundled observability stack
 (collector, metrics, logs, traces, dashboards).
 
@@ -12,7 +12,7 @@ Env overlays: `values-dev.yaml`, `values-prod.yaml` (plus `values-public-alb.yam
 **Break-glass Helm** (disable Argo auto-sync first after cutover):
 
 ```sh
-helm upgrade --install techx-corp ./ -n techx-corp-prod --create-namespace \
+helm upgrade --install platform ./ -n platform-prod --create-namespace \
   -f values-public-alb.yaml -f values-prod.yaml
 ```
 
@@ -24,13 +24,13 @@ An opt-in public ALB-backed Ingress is available to expose the storefront while 
 
 Ensure the AWS Load Balancer Controller is installed in your EKS cluster:
 
-1. **Create the IAM Role and Policy (IRSA)**: Run `terraform apply` in the `techx-corp-infra` folder to provision the controller's IAM role.
+1. **Create the IAM Role and Policy (IRSA)**: Run `terraform apply` in the `infra` folder to provision the controller's IAM role.
 2. **Install the AWS Load Balancer Controller via Helm** (prefer Terraform output so `region` + `vpcId` + IRSA are set — avoids IMDS hop-limit CrashLoop):
    ```sh
    helm repo add eks https://aws.github.io/eks-charts
    helm repo update
    # Preferred: values filled by Terraform
-   terraform -chdir=../techx-corp-infra/environments/production \
+   terraform -chdir=../infra/environments/production \
      output -raw aws_load_balancer_controller_helm_command
    # Run the printed command. Manual equivalent:
    helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
@@ -48,14 +48,14 @@ Ensure the AWS Load Balancer Controller is installed in your EKS cluster:
 To deploy the chart with public ALB enabled, supply the `values-public-alb.yaml` overlay:
 
 ```sh
-helm upgrade --install techx-corp ./ -n techx-tf2 -f values-public-alb.yaml --create-namespace
+helm upgrade --install platform ./ -n platform --create-namespace -f values-public-alb.yaml
 ```
 
 ### Verification
 
 1. **Verify the Ingress receives a public DNS host**:
    ```sh
-   kubectl -n techx-tf2 get ingress frontend-proxy-public
+   kubectl -n platform get ingress frontend-proxy-public
    ```
    *Note: It may take 2-5 minutes for the AWS ALB to provision and register.*
 
@@ -75,7 +75,7 @@ helm upgrade --install techx-corp ./ -n techx-tf2 -f values-public-alb.yaml --cr
 
 ## SEC-04: Security Context Hardening
 
-This chart has been hardened to conform to restricted Pod Security Standards. For detailed information, see [SEC-04-notes.md](file:///E:/code-folder/xbrain_projects/phase3/techx-corp-chart/SEC-04-notes.md).
+This chart has been hardened to conform to restricted Pod Security Standards. For detailed information, see [SEC-04-notes.md](./SEC-04-notes.md).
 
 ### Documented Exceptions to `readOnlyRootFilesystem: true`
 - **postgresql**: Requires writing to state/database files.
@@ -85,4 +85,3 @@ This chart has been hardened to conform to restricted Pod Security Standards. Fo
 
 ## License
 Apache License 2.0.
-

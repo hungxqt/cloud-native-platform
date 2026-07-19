@@ -12,8 +12,8 @@ Cluster-specific Argo CD `AppProject` + `Application` manifests for the platform
 | Application (prod / dev) | Path | Helm release | Namespace |
 |--------------------------|------|--------------|-----------|
 | `root-prod` / `root-dev` | `gitops/clusters/{prod,dev}` (directory) | n/a (app-of-apps) | `argocd` |
-| `techx-corp` / `techx-corp-dev` | `.` (root chart) | `techx-corp` / `techx-corp-dev` | `techx-corp-prod` / `techx-corp-dev` |
-| `techx-corp-secrets` / `techx-corp-secrets-dev` | `secrets-chart` | `techx-corp-secrets` | same as app NS |
+| `platform` / `platform-dev` | `.` (root chart) | `platform` / `platform-dev` | `platform-prod` / `platform-dev` |
+| `platform-secrets` / `platform-secrets-dev` | `secrets-chart` | `platform-secrets` | same as app NS |
 | `runtime-hardening` (prod only) | `gitops/runtime-hardening/overlays/audit`, `enforce`, then `enforce-clusterwide` | n/a | cluster-scoped |
 
 `secrets-chart` is a **separate** Application from the main app chart so ExternalSecret
@@ -25,7 +25,7 @@ and native Kubernetes runtime-hardening admission.
 
 ## Prerequisites
 
-1. Argo CD installed (`argocd_enabled=true` in `techx-corp-infra`, or equivalent Helm).
+1. Argo CD installed (`argocd_enabled=true` in `infra`, or equivalent Helm).
 2. Git repository credentials Secret in namespace `argocd` (GitHub App / deploy key / PAT).
 3. ESO + `ClusterSecretStore` Ready before first secrets Application sync (SEC-05).
 4. `values-dev.yaml` / `values-prod.yaml` image tags match **currently running** tags before first app sync.
@@ -42,26 +42,26 @@ directory apply creates the AppProject before the Application (avoids
 stale after a race, hard-refresh the root Application.
 
 ```cmd
-cd /d techx-corp-chart
+cd /d chart
 
 REM Dev
 kubectl apply -f gitops\bootstrap\dev\
 argocd app wait root-dev --sync --health --timeout 300
-argocd app wait techx-corp-secrets-dev --sync --health --timeout 300
-argocd app wait techx-corp-dev --sync --health --timeout 600
+argocd app wait platform-secrets-dev --sync --health --timeout 300
+argocd app wait platform-dev --sync --health --timeout 600
 ```
 
 ```cmd
-cd /d techx-corp-chart
+cd /d chart
 
 REM Prod
 kubectl apply -f gitops\bootstrap\prod\
 argocd app wait root-prod --sync --health --timeout 300
-argocd app wait techx-corp-secrets --sync --health --timeout 300
-argocd app wait techx-corp --sync --health --timeout 600
+argocd app wait platform-secrets --sync --health --timeout 300
+argocd app wait platform --sync --health --timeout 600
 ```
 
-Adopting an existing `techx-corp-secrets` Helm release: keep `releaseName: techx-corp-secrets`.
+Adopting an existing `platform-secrets` Helm release: keep `releaseName: platform-secrets`.
 First sync may show OutOfSync only for Argo tracking labels until stamped — expected.
 
 Break-glass: disable auto-sync on the root Application before emergency edits to

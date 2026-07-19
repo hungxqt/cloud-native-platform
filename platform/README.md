@@ -1,18 +1,18 @@
-# TechX Corp Platform
+# Platform
 
-Internal microservice platform powering the TechX Corp online store: a polyglot,
+Internal microservice platform powering the online store: a polyglot,
 Kubernetes-native system with a web storefront, product/cart/checkout/payment
 services, an async messaging pipeline, an AI product-review summarizer, and a
 full observability stack (metrics, logs, traces, dashboards).
 
 ## Layout
 - `src/` - application microservices + AI review service + LLM
-- `kubernetes/` - all-in-one manifest (`techx-corp-platform.yaml`)
+- `kubernetes/` - all-in-one manifest (`platform.yaml`)
 - `docker-compose.yml` - local run
 - `Makefile` - build / run helpers
 - `.github/workflows/` - CI checks and ECR build/push
 
-Kubernetes deploy: use the Helm chart in `../techx-corp-chart`.
+Kubernetes deploy: use the Helm chart in `../chart`.
 
 ## CI/CD
 GitHub Actions builds multi-arch images and pushes them to AWS ECR via OIDC.
@@ -23,7 +23,7 @@ GitHub Actions builds multi-arch images and pushes them to AWS ECR via OIDC.
 |---|---|---|
 | PR | — | lint + unit tests (`ci.yml`) |
 | push `main` with `src/**` changes / tag `v*` | `production` | full publish → ECR, then open chart PR for `values-prod.yaml` |
-| push `techx-dev-corp` with `src/**` changes | `development` | full publish → ECR, then direct-push chart `values-dev.yaml` tag |
+| push `dev` with `src/**` changes | `development` | full publish → ECR, then direct-push chart `values-dev.yaml` tag |
 | branch push without `src/**` changes | — | publishing skipped (docs, workflows, compose/bake-only, etc.) |
 | manual dispatch | chosen | matching environment (use for republish without `src/` edits) |
 
@@ -32,7 +32,7 @@ GitHub Actions builds multi-arch images and pushes them to AWS ECR via OIDC.
 - **`release-ready`** gates promotion. **Dev** direct-pushes chart `default.image.tag`. **Prod** opens a chart PR for `values-prod.yaml` (human merge). Both need secret `CHART_REPO_TOKEN`.
 
 Image format: `[REGISTRY]/[PROJECT]/[SERVICE]:[VERSION]`  
-(e.g. `…/techx-dev-corp/ad:sha-a1b2c3d`).
+(e.g. `…/platform-dev/ad:sha-a1b2c3d`).
 
 Setup:
 

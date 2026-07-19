@@ -21,7 +21,7 @@ To run the Ad Service:
 ```sh
 export AD_PORT=8080
 export FEATURE_FLAG_GRPC_SERVICE_ADDR=featureflagservice:50053
-./build/install/techx-corp-ad/bin/Ad
+./build/install/oteldemo/bin/Ad
 ```
 
 ### Upgrading Gradle
@@ -34,7 +34,7 @@ If you need to upgrade the version of gradle then run
 
 ## Building Docker
 
-From the root of `techx-corp`, run:
+From the platform root, run:
 
 ```sh
 docker build --file ./src/ad/Dockerfile ./

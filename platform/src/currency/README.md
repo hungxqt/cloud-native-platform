@@ -5,8 +5,8 @@ It is a C++ based service.
 
 ## Building docker image
 
-To build the currency service, run the following from root directory
-of techx-corp
+To build the currency service, run the following from the platform
+root directory
 
 ```sh
 docker compose build currency

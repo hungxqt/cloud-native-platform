@@ -7,8 +7,8 @@ It is a PHP based service, using a combination of automatic and manual instrumen
 
 ## Docker Build
 
-To build the quote service, run the following from root directory
-of techx-corp
+To build the quote service, run the following from the platform
+root directory
 
 ```sh
 docker compose build quote
@@ -23,7 +23,7 @@ docker compose up quote
 ```
 
 In order to get traffic into the service you have to deploy
-the whole techx-corp.
+the whole platform stack.
 
 Please follow the root README to do so.
 
