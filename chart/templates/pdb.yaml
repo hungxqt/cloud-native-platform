@@ -1,0 +1,28 @@
+{{- range $name, $config := .Values.components }}
+    {{- if not (hasKey . "componentServiceAccount") }}
+    {{-   $_ := set . "componentServiceAccount" .serviceAccount }}
+    {{- end }}
+    {{- $config := set . "Capabilities" $.Capabilities }}
+    {{- $config := set . "Template" $.Template }}
+    {{- $config := set . "name" ($name | lower) }}
+    {{- $config := set . "Release" $.Release }}
+    {{- $config := set . "Chart" $.Chart }}
+    {{- $config := set . "serviceAccount" $.Values.serviceAccount }}
+    {{- $config := set . "observability" $.Values.observability }}
+    {{- $config := set . "defaultValues" $.Values.default }}
+
+    {{- $fixedReplicas := int $.Values.default.replicas -}}
+    {{- if hasKey $config "replicas" -}}
+        {{- $fixedReplicas = int $config.replicas -}}
+    {{- end -}}
+    {{- $activeReplicaFloor := $fixedReplicas -}}
+    {{- if and $config.autoscaling $config.autoscaling.enabled -}}
+        {{- /* An active HPA owns replicas; ignore any stale fixed replica value. */ -}}
+        {{- $activeReplicaFloor = int ($config.autoscaling.minReplicas | default 1) -}}
+    {{- end -}}
+
+    {{- if and $config.enabled (not $config.stateful) (ge $activeReplicaFloor 2) -}}
+        {{- include "techx-corp.pdb" $config -}}
+    {{- end }}
+{{- end }}
+{{/* Change trail: @hungxqt - 2026-07-15 - Base PDB eligibility on the active replica controller floor. */}}

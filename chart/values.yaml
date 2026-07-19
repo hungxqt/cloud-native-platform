@@ -1,0 +1,2910 @@
+# yaml-language-server: $schema=./values.schema.json
+
+# SEC-05: NetworkPolicy — east-west traffic restriction.
+# Requires a CNI that enforces NetworkPolicy (e.g. AWS VPC CNI with Network Policy support,
+# Calico, Cilium). Verify CNI support before enabling in production.
+# Docs: docs/operations/network-policy.md
+#
+# Roll-out approach (recommended):
+#   Phase 1 — audit: deploy with enabled: false, preview blocked flows with CNI audit tool.
+#   Phase 2 — enforce: set enabled: true in dev; soak 24h, check OTel traces for errors.
+#   Phase 3 — promote: apply to prod after dev soak is clean.
+networkPolicy:
+  enabled: false # flip to true after CNI audit (see docs above)
+
+#
+# SEC-05: Sensitive credentials use secretKeyRef → ESO-synced Secrets.
+# Deploy order: ESO + ClusterSecretStore → techx-corp-secrets → wait Ready → techx-corp.
+# Local demo with plaintext: -f values-demo.yaml (never for production).
+# Docs: docs/operations/external-secrets.md
+
+externalSecrets:
+  enabled: true
+  secretStoreName: aws-secretsmanager
+  # Default matches production release namespace; override in values-dev.yaml for dev.
+  namespace: techx-corp-prod
+
+default:
+  storageClassName: gp2
+  rollout:
+    strategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxUnavailable: 0
+        maxSurge: 1
+    minReadySeconds: 10
+    progressDeadlineSeconds: 300
+  # List of environment variables applied to all components
+  env:
+    - name: OTEL_SERVICE_NAME
+      valueFrom:
+        fieldRef:
+          apiVersion: v1
+          fieldPath: "metadata.labels['app.kubernetes.io/component']"
+    - name: OTEL_COLLECTOR_NAME
+      value: otel-collector
+    - name: OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE
+      value: cumulative
+  # Allows overriding and additions to .Values.default.env
+  envOverrides: []
+  #  - name: OTEL_K8S_NODE_NAME
+  #    value: "someConstantValue"
+  image:
+    # Image format: REGISTRY/PROJECT/SERVICE:VERSION
+    #   e.g. 493499579600.dkr.ecr.us-east-1.amazonaws.com/techx-corp/ad:sha-a1b2c3d
+    # repository = REGISTRY/PROJECT (service name is appended by the chart template)
+    #   helm ... --set default.image.repository=<ACCOUNT>.dkr.ecr.<REGION>.amazonaws.com/techx-corp
+    #            --set default.image.tag=sha-a1b2c3d
+    repository: 493499579600.dkr.ecr.us-east-1.amazonaws.com/techx-corp
+    # Tag/VERSION only (no service suffix). Service is part of the repository path.
+    tag: "1.0"
+    pullPolicy: IfNotPresent
+    pullSecrets: []
+  # Default # of replicas for all components
+  replicas: 1
+  # default revisionHistoryLimit for all components (number of old ReplicaSets to retain)
+  revisionHistoryLimit: 10
+  # Default scheduling: hard placement on Karpenter spot-tolerant nodes.
+  # nodeSelector is the hard requirement; Spot capacity-type affinity is preference only.
+  # NodePool weight (infra) decides Spot vs On-Demand fallback — do not treat affinity as primary/fallback.
+  # topologySpreadConstraints are soft balancing only (ScheduleAnyway); labelSelector is template-injected.
+  # Critical components override with nodeSelector workload-class=critical (no Karpenter toleration)
+  # and topologySpreadConstraints: [] (opt-out — small critical MNG floor).
+  # See techx-corp-infra/docs/workload-placement.md and docs/operations/workload-placement.md
+  schedulingRules: &scheduling-spot-tolerant
+    nodeSelector:
+      workload-class: spot-tolerant
+    affinity:
+      nodeAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+                - key: karpenter.sh/capacity-type
+                  operator: In
+                  values:
+                    - spot
+    tolerations:
+      - key: workload-class
+        operator: Equal
+        value: spot-tolerant
+        effect: NoSchedule
+    # Soft multi-AZ / multi-node balancing within the spot-tolerant pool only.
+    # Does not weaken hard nodeSelector or tolerations; ScheduleAnyway never blocks on capacity.
+    topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+  # Default podSecurityContext for all components
+  podSecurityContext:
+    seccompProfile:
+      type: RuntimeDefault
+  # Default securityContext for all components
+  securityContext:
+    runAsNonRoot: true
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+  # Default initContainerSecurityContext for all components
+  initContainerSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+  # Runtime-hardening baseline for every first-party init container.
+  # Components may override individual values under initContainers[].resources.
+  initContainerResources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
+
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template
+  name: ""
+
+# Mem0 self-hosted with Amazon RDS IAM database authentication.
+# Keep disabled in base values. An environment overlay must supply the RDS
+# endpoint, IRSA role, and FastEmbed modelDelivery.s3Prefix (+ archiveName).
+# Image follows the global release contract (default.image.repository/mem0:default.image.tag)
+# so platform chart promote keeps Mem0 in lockstep with the other 21 services.
+# Optional mem0.image.repository / mem0.image.tag are break-glass overrides only.
+# Runtime and RDS-master Kubernetes Secrets are synced by secrets-chart (SEC-05).
+mem0:
+  enabled: false
+  awsRegion: us-east-1
+  replicas: 1
+  image:
+    # Empty → {{ default.image.repository }}/mem0:{{ default.image.tag }}
+    repository: ""
+    tag: ""
+  rds:
+    host: ""
+    port: 5432
+    database: mem0
+    # IAM database user created by the migrate Job bootstrap script.
+    appUser: mem0_app
+  serviceAccount:
+    name: mem0
+    roleArn: ""
+  # Secret names only — ExternalSecrets live in secrets-chart.
+  runtimeSecretName: techx-corp-mem0
+  masterSecretName: techx-corp-mem0-rds-master
+  cleanupSchedule: "17 3 * * *"
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  migrate:
+    ttlSecondsAfterFinished: 86400
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+  cleanup:
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+  # Cold start covers FastEmbed load + first RDS IAM token after model fetch.
+  probes:
+    startup:
+      periodSeconds: 5
+      timeoutSeconds: 5
+      failureThreshold: 36
+    liveness:
+      periodSeconds: 15
+      timeoutSeconds: 5
+      failureThreshold: 3
+    readiness:
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 3
+  # FastEmbed cache is published by platform CI under the same VERSION as the image.
+  # Rendered URI: {{ s3Prefix }}/{{ imageTag }}/{{ archiveName }}
+  # IRSA prefix (infra): fastembed/paraphrase-multilingual-MiniLM-L12-v2/
+  # Optional s3Uri fully overrides the composed URI (break-glass only).
+  modelDelivery:
+    enabled: false
+    awsRegion: us-east-1
+    fetcherImage: public.ecr.aws/aws-cli/aws-cli:2.27.49
+    extractorImage: busybox:1.37.0
+    s3Prefix: ""
+    archiveName: fastembed-paraphrase-multilingual-MiniLM-L12-v2-faf4aa422582.tar.gz
+    s3Uri: ""
+    mountPath: /models/fastembed
+    cacheSizeLimit: 2Gi
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+# SEC-03 least-privilege: any component may declare its OWN serviceAccount to get
+# a distinct, auditable identity instead of sharing the global one above. Fallback
+# rules:
+#   - Component WITHOUT serviceAccount  -> uses the global serviceAccount (default).
+#   - Component WITH serviceAccount     -> gets its own SA; name defaults to the
+#                                          component name when `name` is omitted.
+#   - IRSA role ARNs are NEVER inherited from global; declare them explicitly only
+#     on the workload that needs AWS access.
+# Example (do not enable globally — only for workloads with a real need):
+#
+# components:
+#   accounting:
+#     serviceAccount:
+#       create: true
+#       name: techx-corp-accounting
+#       annotations:
+#         eks.amazonaws.com/role-arn: arn:aws:iam::<ACCOUNT_ID>:role/techx-corp-accounting
+#   fraud-detection:
+#     serviceAccount:
+#       create: true
+#       name: techx-corp-fraud-detection
+#       annotations:
+#         eks.amazonaws.com/role-arn: arn:aws:iam::<ACCOUNT_ID>:role/techx-corp-fraud-detection
+
+components:
+  ## Demo Components are named objects (services) with several properties
+  # demoService:
+  ## Enable the component (service)
+  #   enabled: true
+  #   useDefault:
+  ## Use default environment variables
+  #     env: true
+  ## Image overrides (optional):
+  ##   imageOverride.repository + optional tag — full image path (third-party images).
+  ##   imageOverride.name — ECR service segment only; keeps default.image.repository/tag
+  ##     (use when K8s component name ≠ bake/ECR service name, e.g. load-generator-worker).
+  ##   imageOverride.tag alone — pin tag while keeping default repository + component name.
+  #   imageOverride: {}
+  ## Optional service definitions to apply
+  #   service:
+  ## Service Type to use for this component. Default is ClusterIP.
+  #     type: ClusterIP
+  ## Service Port to use to expose this component. Default is nil
+  #     port: 8080
+  ## Service Node Port to use to expose this component on a NodePort service. Default is nil
+  #     nodePort: 30080
+  ## Service Annotations to add to this component
+  #     annotations: {}
+  ## Additional service ports to use to expose this component
+  #   ports:
+  #     - name: extraServicePort
+  #       value: 8081
+  ## Environment variables to add to the component's pod
+  #   env:
+  ## Environment variables that upsert (append + merge) into the `env` specification for this component.
+  ## A variable named OTEL_RESOURCE_ATTRIBUTES_EXTRA will have its value appended to the OTEL_RESOURCE_ATTRIBUTES value.
+  #   envOverrides:
+  ## Pod Scheduling rules for nodeSelector, affinity, tolerations, or topologySpreadConstraints.
+  #   schedulingRules:
+  #     nodeSelector: {}
+  #     affinity: {}
+  #     tolerations: []
+  #     topologySpreadConstraints: []  # empty list clears default soft spreads
+  ## Pod labels to add to this component
+  #   podLabels: {}
+  ## Pod Annotations to add to this component
+  #   podAnnotations: {}
+  ## Resources for this component
+  #   resources: {}
+  ## Container security context for setting user ID (UID), group ID (GID) and other security policies
+  #   securityContext:
+  ## Ingresses rules to add for the to the component
+  # ingress:
+  ## Enable the creation of Ingress rules. Default is false
+  #   enabled: false
+  ## Annotations to add to the ingress rule
+  #   annotations: {}
+  ## Which Ingress class (controller) to use. Default is unspecified.
+  #   ingressClassName: nginx
+  ## Hosts definitions for the Ingress rule
+  #   hosts:
+  #     - host: demo.example.com
+  ## Each host can have multiple paths/routes
+  #       paths:
+  #         - path: /
+  #           pathType: Prefix
+  #           port: 8080
+  ## Optional TLS specifications for the Ingress rule
+  #   tls:
+  #     - secretName: demo-tls
+  #       hosts:
+  #         - demo.example.com
+  ## Additional ingresses - only created if ingress.enabled is true
+  ## Useful for when differently annotated ingress services are required
+  ## Each additional ingress needs key "name" set to something unique
+  #   additionalIngresses: []
+  #     - name: extra-demo-ingress
+  #       ingressClassName: nginx
+  #       annotations: {}
+  #       hosts:
+  #         - host: demo.example.com
+  #           paths:
+  #             - path: /
+  #               pathType: Prefix
+  #               port: 8080
+  #       tls:
+  #         - secretName: demo-tls
+  #           hosts:
+  #             - demo.example.com
+  ## Command to use in the container spec, in case you don't want to go with the default command from the image.
+  #   command: []
+  ## Configuration to for this component; will create a Volume, and Mount backed by an optionally created ConfigMap.
+  ## The name, mountPath are required, and one of existingConfigMap or data is required.
+  ## If an existing ConfigMap is not provided, the contents under data will be used for the created ConfigMap.
+  #   mountedConfigMaps: []
+  #     - name: my-config
+  #       mountPath: /etc/config
+  #       subPath:
+  #       existingConfigMap: my-configmap
+  #       data:
+  #         my-config.yaml: |
+  #           key: value
+  ## Configuration to create an custom Volume
+  #   additionalVolumes:
+  #     - name: nginx-logs
+  #       hostPath:
+  #         path: /var/log/nginx
+  #       type: ""
+  ## Configuration to mount the custom Volume to the container
+  # additionalVolumeMounts:
+  #     - name: nginx-logs
+  #       mountPath: /var/log/nginx
+  # # Kubernetes container health check options
+  #   livenessProbe: {}
+  #   readinessProbe: {}
+  # # Optional init container to run before the pod starts.
+  #   initContainers:
+  #     - name: <init-container-name>
+  #       image: <init-container-image>
+  #       command: [list of commands for the init container to run]
+  # # Replicas for the component
+  #  replicas: 1
+  # # Number of old ReplicaSets to retain
+  #  revisionHistoryLimit: 10
+  # # Optional pod security context for setting user ID (UID), group ID (GID) and other security policies
+  # # This will be applied at pod level, can be applied globally for all pods: .Values.default.podSecurityContext
+  # # Or it can be applied to a specific component: .Values.components.<component-name>.podSecurityContext
+  #    podSecurityContext:
+  #      runAsGroup: 65534
+  #      runAsNonRoot: true
+  #      runAsUser: 65534
+
+  accounting:
+    enabled: true
+    useDefault:
+      env: true
+    securityContext:
+      runAsUser: 10001
+      runAsGroup: 10001
+    env:
+      - name: KAFKA_ADDR
+        value: kafka:9092
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: http://$(OTEL_COLLECTOR_NAME):4318
+      # SEC-05: sourced from ESO-synced Secret (see secrets-chart / docs/operations/external-secrets.md)
+      - name: DB_CONNECTION_STRING
+        valueFrom:
+          secretKeyRef:
+            name: techx-corp-postgresql-app
+            key: accounting-db-connection-string
+      - name: OTEL_DOTNET_AUTO_TRACES_ENTITYFRAMEWORKCORE_INSTRUMENTATION_ENABLED
+        value: "false"
+    resources:
+      # 50-user baseline: P99 CPU 7.18m, P99 memory 164Mi.
+      requests:
+        cpu: 10m
+        memory: 200Mi
+      limits:
+        cpu: 100m
+        memory: 300Mi
+    mountedEmptyDirs:
+      - name: tmp-dir
+        mountPath: /tmp
+      - name: otel-log-dir
+        mountPath: /var/log/opentelemetry/dotnet
+    initContainers:
+      - name: wait-for-kafka
+        image: busybox:1.37.0
+        command:
+          [
+            "sh",
+            "-c",
+            "until nc -z -v -w30 kafka 9092; do echo waiting for kafka; sleep 2; done;",
+          ]
+      - name: wait-for-postgresql
+        image: busybox:1.37.0
+        command:
+          [
+            "sh",
+            "-c",
+            "until nc -z -v -w30 postgresql 5432; do echo waiting for postgresql; sleep 2; done;",
+          ]
+
+  ad:
+    enabled: true
+    useDefault:
+      env: true
+    # Tier C (JVM): see docs/operations/probe-thresholds.md
+    readinessProbe:
+      grpc:
+        port: 8080
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 6
+    livenessProbe:
+      grpc:
+        port: 8080
+      periodSeconds: 20
+      timeoutSeconds: 5
+      failureThreshold: 5
+    service:
+      port: 8080
+    env:
+      - name: AD_PORT
+        value: "8080"
+      - name: FLAGD_HOST
+        value: flagd
+      - name: FLAGD_PORT
+        value: "8013"
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: http://$(OTEL_COLLECTOR_NAME):4318
+      - name: OTEL_LOGS_EXPORTER
+        value: otlp
+    resources:
+      # 50-user baseline: P99 CPU 2.34m, P99 memory 270Mi. Keep JVM/GC headroom.
+      requests:
+        cpu: 10m
+        memory: 320Mi
+      limits:
+        cpu: 200m
+        memory: 400Mi
+    mountedEmptyDirs:
+      - name: tmp-dir
+        mountPath: /tmp
+
+  cart:
+    enabled: true
+    useDefault:
+      env: true
+    # Tier B; liveness is tcp so failedReadinessProbe chaos does not restart pods
+    readinessProbe:
+      grpc:
+        port: 8080
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+    livenessProbe:
+      tcpSocket:
+        port: 8080
+      periodSeconds: 15
+      timeoutSeconds: 5
+      failureThreshold: 5
+    service:
+      port: 8080
+    env:
+      - name: CART_PORT
+        value: "8080"
+      - name: ASPNETCORE_URLS
+        value: http://*:$(CART_PORT)
+      - name: VALKEY_ADDR
+        value: valkey-cart:6379
+      - name: FLAGD_HOST
+        value: flagd
+      - name: FLAGD_PORT
+        value: "8013"
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: http://$(OTEL_COLLECTOR_NAME):4317
+    resources:
+      # 50-user baseline: P95/P99 CPU 17.3m/18.4m, P99 memory 158Mi.
+      requests:
+        cpu: 30m
+        memory: 192Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+    # Hot-path under scaled frontend/checkout; Karpenter (default spot-tolerant).
+    # Valkey remains singleton; cart pods are stateless clients.
+    # Dual metrics: RPS primary; CPU 70% safety valve (HPA uses max).
+    # behavior anchor is shared by all HPA-enabled services (must be defined before first alias).
+    # Loosened 2026-07-17: higher RPS targets + dampened scale-up (30s stabilize, 50%/30s)
+    # and longer scale-down stabilize (120s) to reduce RPS-noise thrash.
+    # maxReplicas 12: load-test pin at 6 with CPU ~110%/70% → desired ~10; +headroom.
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 12
+      targetCPUUtilizationPercentage: 70
+      # .NET service comfortable ~150 RPS/pod (raised from 100 to delay RPS scale-out).
+      targetRequestsPerSecond: 150
+      behavior: &hpa-behavior-default
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+            - type: Pods
+              value: 2
+              periodSeconds: 30
+            - type: Percent
+              value: 50
+              periodSeconds: 30
+          selectPolicy: Max
+        scaleDown:
+          stabilizationWindowSeconds: 120
+          policies:
+            - type: Percent
+              value: 50
+              periodSeconds: 60
+    mountedEmptyDirs:
+      - name: tmp-dir
+        mountPath: /tmp
+    initContainers:
+      - name: wait-for-valkey-cart
+        image: busybox:1.37.0
+        command:
+          [
+            "sh",
+            "-c",
+            "until nc -z -v -w30 valkey-cart 6379; do echo waiting for valkey-cart; sleep 2; done;",
+          ]
+
+  checkout:
+    enabled: true
+    useDefault:
+      env: true
+    # Tier B (Go gRPC): see docs/operations/probe-thresholds.md
+    readinessProbe:
+      grpc:
+        port: 8080
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+    livenessProbe:
+      grpc:
+        port: 8080
+      periodSeconds: 15
+      timeoutSeconds: 5
+      failureThreshold: 5
+    service:
+      port: 8080
+    env:
+      - name: CHECKOUT_PORT
+        value: "8080"
+      - name: CART_ADDR
+        value: cart:8080
+      - name: CURRENCY_ADDR
+        value: currency:8080
+      - name: EMAIL_ADDR
+        value: http://email:8080
+      - name: PAYMENT_ADDR
+        value: payment:8080
+      - name: PRODUCT_CATALOG_ADDR
+        value: product-catalog:8080
+      - name: SHIPPING_ADDR
+        value: http://shipping:8080
+      - name: KAFKA_ADDR
+        value: kafka:9092
+      - name: FLAGD_HOST
+        value: flagd
+      - name: FLAGD_PORT
+        value: "8013"
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: http://$(OTEL_COLLECTOR_NAME):4317
+      - name: GOMEMLIMIT
+        value: 100MiB
+    resources:
+      # 50-user baseline: P95/P99 CPU 5.93m/6.21m, P99 memory 34.4Mi.
+      requests:
+        cpu: 10m
+        memory: 48Mi
+      limits:
+        cpu: 150m
+        memory: 128Mi
+    # Dual metrics: expensive orchestration → lower RPS target; CPU safety valve.
+    # maxReplicas 16: load-test pin at 6 with CPU ~148%/70% → desired ~13; +headroom.
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 16
+      targetCPUUtilizationPercentage: 70
+      # Go orchestration: raised from 30 → 50 RPS/pod (less aggressive RPS scale-out).
+      targetRequestsPerSecond: 50
+      behavior: *hpa-behavior-default
+    initContainers:
+      - name: wait-for-kafka
+        image: busybox:1.37.0
+        command:
+          [
+            "sh",
+            "-c",
+            "until nc -z -v -w30 kafka 9092; do echo waiting for kafka; sleep 2; done;",
+          ]
+
+  currency:
+    enabled: true
+    useDefault:
+      env: true
+    # Tier A (native C++ gRPC, low CPU): see docs/operations/probe-thresholds.md
+    readinessProbe:
+      grpc:
+        port: 8080
+      periodSeconds: 10
+      timeoutSeconds: 2
+      failureThreshold: 3
+    livenessProbe:
+      grpc:
+        port: 8080
+      periodSeconds: 20
+      timeoutSeconds: 3
+      failureThreshold: 3
+    service:
+      port: 8080
+    env:
+      - name: CURRENCY_PORT
+        value: "8080"
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: http://$(OTEL_COLLECTOR_NAME):4317
+      - name: VERSION
+        value: "{{ .Chart.AppVersion }}"
+      - name: IPV6_ENABLED
+        value: "false"
+    resources:
+      # 50-user baseline: P99 CPU 3.96m, P99 memory 3.94Mi.
+      requests:
+        cpu: 30m
+        memory: 16Mi
+      limits:
+        cpu: 100m
+        memory: 16Mi
+    # High-RPS / low-CPU gRPC (native C++): RPS is the primary capacity signal; CPU often never hits 70%.
+    # maxReplicas 72: load-test pin at 12 with CPU ~412%/70% → desired ~71 (tiny 10m request amplifies %).
+    autoscaling:
+      enabled: true
+      minReplicas: 1
+      maxReplicas: 72
+      targetCPUUtilizationPercentage: 70
+      # Native C++ gRPC: raised from 150 → 250 RPS/pod (high RPS / low CPU path).
+      targetRequestsPerSecond: 250
+      behavior: *hpa-behavior-default
+
+  email:
+    enabled: true
+    useDefault:
+      env: true
+    # Tier B (no HTTP health route): tcp only
+    readinessProbe:
+      tcpSocket:
+        port: 8080
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+    livenessProbe:
+      tcpSocket:
+        port: 8080
+      periodSeconds: 15
+      timeoutSeconds: 5
+      failureThreshold: 5
+    service:
+      port: 8080
+    env:
+      - name: EMAIL_PORT
+        value: "8080"
+      - name: APP_ENV
+        value: production
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: http://$(OTEL_COLLECTOR_NAME):4318
+      - name: FLAGD_HOST
+        value: flagd
+      - name: FLAGD_PORT
+        value: "8013"
+    resources:
+      # kubectl top: 2m CPU, 51Mi mem. P99 mem: 52Mi. Low-traffic async service.
+      requests:
+        cpu: 10m
+        memory: 64Mi
+      limits:
+        cpu: 100m
+        memory: 128Mi
+    mountedEmptyDirs:
+      - name: tmp-dir
+        mountPath: /tmp
+
+  fraud-detection:
+    enabled: true
+    useDefault:
+      env: true
+    env:
+      - name: KAFKA_ADDR
+        value: kafka:9092
+      - name: FLAGD_HOST
+        value: flagd
+      - name: FLAGD_PORT
+        value: "8013"
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: http://$(OTEL_COLLECTOR_NAME):4318
+      - name: OTEL_INSTRUMENTATION_KAFKA_EXPERIMENTAL_SPAN_ATTRIBUTES
+        value: "true"
+      - name: OTEL_INSTRUMENTATION_MESSAGING_EXPERIMENTAL_RECEIVE_TELEMETRY_ENABLED
+        value: "true"
+    resources:
+      # 50-user baseline: P99 CPU 7.12m, P99 memory 263Mi.
+      requests:
+        cpu: 10m
+        memory: 320Mi
+      limits:
+        cpu: 200m
+        memory: 400Mi
+    mountedEmptyDirs:
+      - name: tmp-dir
+        mountPath: /tmp
+    initContainers:
+      - name: wait-for-kafka
+        image: busybox:1.37.0
+        command:
+          [
+            "sh",
+            "-c",
+            "until nc -z -v -w30 kafka 9092; do echo waiting for kafka; sleep 2; done;",
+          ]
+
+  frontend:
+    enabled: true
+    useDefault:
+      env: true
+    # Stateless app → Karpenter (inherits default hard spot-tolerant contract)
+    schedulingRules: *scheduling-spot-tolerant
+    # Tier B† (Next.js GET / is heavier): timeout 5s; see probe-thresholds.md
+    readinessProbe:
+      httpGet:
+        path: /
+        port: 8080
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 3
+    livenessProbe:
+      httpGet:
+        path: /
+        port: 8080
+      periodSeconds: 20
+      timeoutSeconds: 5
+      failureThreshold: 4
+    service:
+      port: 8080
+    env:
+      - name: FRONTEND_PORT
+        value: "8080"
+      - name: PORT
+        value: $(FRONTEND_PORT)
+      - name: FRONTEND_ADDR
+        value: :8080
+      - name: AD_ADDR
+        value: ad:8080
+      - name: CART_ADDR
+        value: cart:8080
+      - name: CHECKOUT_ADDR
+        value: checkout:8080
+      - name: CURRENCY_ADDR
+        value: currency:8080
+      - name: PRODUCT_CATALOG_ADDR
+        value: product-catalog:8080
+      - name: PRODUCT_REVIEWS_ADDR
+        value: product-reviews:3551
+      - name: RECOMMENDATION_ADDR
+        value: recommendation:8080
+      - name: SHIPPING_ADDR
+        value: http://shipping:8080
+      - name: FLAGD_HOST
+        value: flagd
+      - name: FLAGD_PORT
+        value: "8013"
+      - name: ENV_PLATFORM
+        value: kubernetes
+      - name: OTEL_COLLECTOR_HOST
+        value: $(OTEL_COLLECTOR_NAME)
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: http://$(OTEL_COLLECTOR_NAME):4317
+      - name: WEB_OTEL_SERVICE_NAME
+        value: frontend-web
+      - name: PUBLIC_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+        value: /otlp-http/v1/traces # This allows local development and production/ALB relative routing
+    resources:
+      # 50-user baseline: P95/P99 CPU 111m/117m, P99 memory 240Mi.
+      requests:
+        cpu: 160m
+        memory: 288Mi
+      limits:
+        cpu: 500m
+        memory: 384Mi
+    # BFF/SSR: RPS primary (often I/O-wait on backends); CPU safety valve.
+    # maxReplicas 20: load-test pin at 14 with CPU ~100%/80% → desired ~18; +headroom.
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 20
+      targetCPUUtilizationPercentage: 80
+      # BFF/SSR: raised from 50 → 80 RPS/pod (spanmetrics can inflate metric RPS).
+      targetRequestsPerSecond: 80
+      behavior: *hpa-behavior-default
+    mountedEmptyDirs:
+      - name: tmp-dir
+        mountPath: /tmp
+    securityContext:
+      runAsUser: 1001 # nextjs
+      runAsGroup: 1001
+      runAsNonRoot: true
+
+  frontend-proxy:
+    enabled: true
+    useDefault:
+      env: true
+    # Critical ingress/gateway → Critical MNG (not the same as stateless frontend).
+    # Anchor source for other critical components (no Karpenter toleration).
+    # topologySpreadConstraints: [] opts out of default soft spreads (small MNG floor).
+    schedulingRules: &scheduling-critical
+      nodeSelector:
+        workload-class: critical
+      affinity: {}
+      tolerations: []
+      topologySpreadConstraints: []
+    # Tier A: Envoy admin /ready (not data-plane / on 8080)
+    readinessProbe:
+      httpGet:
+        path: /ready
+        port: 10000
+      periodSeconds: 10
+      timeoutSeconds: 2
+      failureThreshold: 3
+    livenessProbe:
+      httpGet:
+        path: /ready
+        port: 10000
+      periodSeconds: 20
+      timeoutSeconds: 3
+      failureThreshold: 3
+    service:
+      port: 8080
+    publicAlb:
+      enabled: false
+      ingressClassName: alb
+      # Internal ALB for CloudFront VPC origin (not internet-facing).
+      # Public edge + path blocking: techx-corp-infra modules/cloudfront-alb.
+      scheme: internal
+      targetType: ip
+      # HTTP:80 required for CloudFront VPC origin. Add HTTPS:443 + certificateArn for
+      # https://internal.hungtran.id.vn (operator private DNS). Never set ssl-redirect.
+      listenPorts: '[{"HTTP":80}]'
+      # ACM ARN in ALB region (us-east-1). Empty = HTTP only.
+      certificateArn: ""
+      host: ""
+      # ALB has no path-block rules by default (blockSensitivePaths=false).
+      # Sensitive prefixes are blocked at CloudFront (viewer-request Function).
+      # Keep blockedPrefixes for optional emergency ALB fixed-response only.
+      # Toggle emergency ALB blocks:
+      #   --set components.frontend-proxy.publicAlb.blockSensitivePaths=true
+      blockSensitivePaths: false
+      blockedPrefixes:
+        - /grafana
+        - /jaeger
+        - /loadgen
+        - /feature
+        - /argocd
+        # /otlp-http and /flagservice are not listed: public browser OTLP + flagd EventStream
+    podAnnotations:
+      io.opentelemetry.discovery.metrics/enabled: "true"
+      io.opentelemetry.discovery.metrics/scraper: httpcheck
+      io.opentelemetry.discovery.metrics/config: |
+        targets:
+          - endpoint: "http://`endpoint`"
+    env:
+      - name: ENVOY_PORT
+        value: "8080"
+      - name: ENVOY_ADDR
+        value: "0.0.0.0"
+      - name: ENVOY_ADMIN_PORT
+        value: "10000"
+      - name: FLAGD_HOST
+        value: flagd
+      - name: FLAGD_PORT
+        value: "8013"
+      - name: FLAGD_UI_HOST
+        value: flagd
+      - name: FLAGD_UI_PORT
+        value: "4000"
+      - name: FRONTEND_HOST
+        value: frontend
+      - name: FRONTEND_PORT
+        value: "8080"
+      - name: GRAFANA_HOST
+        value: grafana
+      - name: GRAFANA_PORT
+        value: "80"
+      - name: IMAGE_PROVIDER_HOST
+        value: image-provider
+      - name: IMAGE_PROVIDER_PORT
+        value: "8081"
+      - name: JAEGER_HOST
+        value: jaeger
+      - name: JAEGER_UI_PORT
+        value: "16686"
+      # Argo CD server (control-plane NS). Envoy routes /argocd/ → this host.
+      # Requires argocd server.insecure=true + rootpath=/argocd (infra modules/argocd).
+      - name: ARGOCD_HOST
+        value: argocd-server.argocd.svc.cluster.local
+      - name: ARGOCD_PORT
+        value: "80"
+      - name: LOCUST_WEB_HOST
+        value: load-generator
+      - name: LOCUST_WEB_PORT
+        value: "8089"
+      - name: OTEL_COLLECTOR_HOST
+        value: $(OTEL_COLLECTOR_NAME)
+      - name: OTEL_COLLECTOR_PORT_GRPC
+        value: "4317"
+      - name: OTEL_COLLECTOR_PORT_HTTP
+        value: "4318"
+    resources:
+      # 50-user baseline: P95/P99 CPU 39.1m/40.5m, P99 memory 67.3Mi.
+      requests:
+        cpu: 60m
+        memory: 80Mi
+      limits:
+        cpu: 300m
+        memory: 128Mi
+    # Edge / ALB target on Critical MNG (small floor). maxReplicas 10 needs MNG headroom.
+    # RPS primary; CPU safety valve. If pods Pending: free Critical capacity in infra.
+    # OTel service.name may differ for Envoy — set autoscaling.serviceName after metric inventory.
+    # maxReplicas 10: load-test pin at 6 with CPU ~110%/80% → desired ~8; +headroom.
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 10
+      targetCPUUtilizationPercentage: 80
+      # Envoy edge: raised from 200 → 300 RPS/pod (delay Critical MNG scale-out).
+      targetRequestsPerSecond: 300
+      behavior: *hpa-behavior-default
+    mountedEmptyDirs:
+      - name: tmp-dir
+        mountPath: /tmp
+    securityContext:
+      runAsUser: 101 # envoy
+      runAsGroup: 101
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop:
+          - ALL
+
+  image-provider:
+    enabled: true
+    useDefault:
+      env: true
+    # Tier A: nginx stub_status /status
+    readinessProbe:
+      httpGet:
+        path: /status
+        port: 8081
+      periodSeconds: 10
+      timeoutSeconds: 2
+      failureThreshold: 3
+    livenessProbe:
+      httpGet:
+        path: /status
+        port: 8081
+      periodSeconds: 20
+      timeoutSeconds: 3
+      failureThreshold: 3
+    service:
+      port: 8081
+    podAnnotations:
+      io.opentelemetry.discovery.metrics/enabled: "true"
+      io.opentelemetry.discovery.metrics/scraper: nginx
+      io.opentelemetry.discovery.metrics/config: |
+        endpoint: "http://`endpoint`/status"
+        collection_interval: "10s"
+        timeout: "20s"
+    env:
+      - name: IMAGE_PROVIDER_PORT
+        value: "8081"
+      - name: OTEL_COLLECTOR_PORT_GRPC
+        value: "4317"
+      - name: OTEL_COLLECTOR_HOST
+        value: $(OTEL_COLLECTOR_NAME)
+    resources:
+      # 50-user baseline: P99 CPU 0.318m, P99 memory 6.97Mi.
+      requests:
+        cpu: 5m
+        memory: 8Mi
+      limits:
+        cpu: 50m
+        memory: 16Mi
+    mountedEmptyDirs:
+      - name: tmp-dir
+        mountPath: /tmp
+    securityContext:
+      runAsUser: 101 # nginx
+      runAsGroup: 101
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop:
+          - ALL
+
+  load-generator:
+    enabled: true
+    # Fixed single master (not HPA). Default 0 saves cost when idle; scale to 1 for tests.
+    replicas: 0
+    useDefault:
+      env: true
+    # Locust master control plane → Critical MNG (system-*); workers stay on Karpenter Spot.
+    schedulingRules: *scheduling-critical
+    command:
+      - locust
+      - --master
+      - --master-bind-host=0.0.0.0
+      - --master-bind-port=5557
+      # Keep OTEL LoggingInstrumentor in locustfile as the sole log setup.
+      - --skip-log-setup
+    service:
+      port: 8089
+    ports:
+      - name: master-bind
+        value: 5557
+    env:
+      - name: LOCUST_WEB_HOST
+        value: "0.0.0.0"
+      - name: LOCUST_WEB_PORT
+        value: "8089"
+      - name: LOCUST_USERS
+        value: "10"
+      - name: LOCUST_SPAWN_RATE
+        value: "1"
+      - name: LOCUST_HOST
+        value: http://frontend-proxy:8080
+      - name: LOCUST_HEADLESS
+        value: "false"
+      - name: LOCUST_AUTOSTART
+        value: "true"
+      # Wait for at least HPA minReplicas workers before autostart (avoids empty swarm race).
+      - name: LOCUST_EXPECT_WORKERS
+        value: "1"
+      - name: LOCUST_BROWSER_TRAFFIC_ENABLED
+        value: "false"
+      - name: PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION
+        value: python
+      - name: FLAGD_HOST
+        value: flagd
+      - name: FLAGD_PORT
+        value: "8013"
+      - name: FLAGD_OFREP_PORT
+        value: "8016"
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: http://$(OTEL_COLLECTOR_NAME):4318
+      - name: HOME
+        value: /tmp
+      - name: XDG_CACHE_HOME
+        value: /tmp/.cache
+      - name: XDG_CONFIG_HOME
+        value: /tmp/.config
+    resources:
+      # HTTP-only Locust controller; browser/Playwright traffic is disabled.
+      requests:
+        cpu: 10m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+    # Master web UI — restart if process becomes unresponsive (not a substitute for worker join).
+    readinessProbe:
+      httpGet:
+        path: /
+        port: 8089
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+    livenessProbe:
+      httpGet:
+        path: /
+        port: 8089
+      periodSeconds: 30
+      timeoutSeconds: 5
+      failureThreshold: 5
+    mountedEmptyDirs:
+      - name: tmp-dir
+        mountPath: /tmp
+
+  load-generator-worker:
+    enabled: true
+    # HPA owns replica count when autoscaling.enabled; fixed replicas only when HPA off.
+    replicas: 0
+    useDefault:
+      env: true
+    # Same Locust image as load-generator master. ECR catalog has only "load-generator"
+    # (no load-generator-worker repo). name remaps the path segment; project + tag stay global.
+    imageOverride:
+      name: load-generator
+    # Workers on Karpenter Spot: pack onto one node first (cost), keep off storefront nodes.
+    # Affinity fully replaces default; restate preferred Spot capacity-type here.
+    # topologySpreadConstraints: [] opts out of default soft multi-node/AZ spreads.
+    schedulingRules:
+      nodeSelector:
+        workload-class: spot-tolerant
+      tolerations:
+        - key: workload-class
+          operator: Equal
+          value: spot-tolerant
+          effect: NoSchedule
+      topologySpreadConstraints: []
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: karpenter.sh/capacity-type
+                    operator: In
+                    values:
+                      - spot
+        # Soft pack: prefer co-locating workers on the same hostname before new nodes.
+        podAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app.kubernetes.io/name
+                      operator: In
+                      values:
+                        - load-generator-worker
+                topologyKey: kubernetes.io/hostname
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app.kubernetes.io/name
+                    operator: In
+                    values:
+                      - frontend
+                      - checkout
+                      - cart
+                      - recommendation
+                      - product-catalog
+                      - payment
+                      - shipping
+                      - ad
+                      - email
+                      - currency
+                      - fraud-detection
+                      - accounting
+                      - image-provider
+                      - quote
+                      - product-reviews
+              topologyKey: "kubernetes.io/hostname"
+    command:
+      - locust
+      - --worker
+      - --master-host=load-generator
+      - --master-port=5557
+      - --skip-log-setup
+    env:
+      - name: LOCUST_HOST
+        value: http://frontend-proxy:8080
+      - name: LOCUST_BROWSER_TRAFFIC_ENABLED
+        value: "false"
+      - name: PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION
+        value: python
+      - name: FLAGD_HOST
+        value: flagd
+      - name: FLAGD_PORT
+        value: "8013"
+      - name: FLAGD_OFREP_PORT
+        value: "8016"
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: http://$(OTEL_COLLECTOR_NAME):4318
+      - name: HOME
+        value: /tmp
+      - name: XDG_CACHE_HOME
+        value: /tmp/.cache
+      - name: XDG_CONFIG_HOME
+        value: /tmp/.config
+    resources:
+      # HTTP-only Locust worker; 50-user baseline P99 CPU 80.1m, memory 73.2Mi.
+      requests:
+        cpu: 125m
+        memory: 96Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+    mountedEmptyDirs:
+      - name: tmp-dir
+        mountPath: /tmp
+    # CPU-only HPA for worker pool (memory omitted — Locust RSS is steady and
+    # memory targets caused unnecessary scale churn). Slow scale-down reduces
+    # Locust master disconnect thrash (fixed user count rebalances after scale-out).
+    autoscaling:
+      enabled: true
+      minReplicas: 1
+      maxReplicas: 8
+      targetCPUUtilizationPercentage: 70
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Pods
+              value: 2
+              periodSeconds: 15
+            - type: Percent
+              value: 100
+              periodSeconds: 15
+          selectPolicy: Max
+        scaleDown:
+          # Restored 300s / 50% per 60s after 30s/100%/15s caused 1↔2 thrash.
+          stabilizationWindowSeconds: 300
+          policies:
+            - type: Percent
+              value: 50
+              periodSeconds: 60
+          selectPolicy: Max
+
+  payment:
+    enabled: true
+    useDefault:
+      env: true
+    # Tier B (Node gRPC health)
+    readinessProbe:
+      grpc:
+        port: 8080
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+    livenessProbe:
+      grpc:
+        port: 8080
+      periodSeconds: 15
+      timeoutSeconds: 5
+      failureThreshold: 5
+    service:
+      port: 8080
+    env:
+      - name: PAYMENT_PORT
+        value: "8080"
+      - name: FLAGD_HOST
+        value: flagd
+      - name: FLAGD_PORT
+        value: "8013"
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: http://$(OTEL_COLLECTOR_NAME):4317
+      - name: IPV6_ENABLED
+        value: "false"
+    resources:
+      # kubectl top: 4m CPU, 104Mi mem (Node.js). P99 mem: 104Mi.
+      requests:
+        cpu: 10m
+        memory: 128Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+    mountedEmptyDirs:
+      - name: tmp-dir
+        mountPath: /tmp
+    securityContext:
+      runAsUser: 1000 # node
+      runAsGroup: 1000
+      runAsNonRoot: true
+
+  product-catalog:
+    enabled: true
+    useDefault:
+      env: true
+    # Stateless → Karpenter hard placement
+    schedulingRules: *scheduling-spot-tolerant
+    # Tier B (Go gRPC); initContainer waits for postgresql
+    readinessProbe:
+      grpc:
+        port: 8080
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+    livenessProbe:
+      grpc:
+        port: 8080
+      periodSeconds: 15
+      timeoutSeconds: 5
+      failureThreshold: 5
+    service:
+      port: 8080
+    env:
+      - name: PRODUCT_CATALOG_PORT
+        value: "8080"
+      - name: FLAGD_HOST
+        value: flagd
+      - name: FLAGD_PORT
+        value: "8013"
+      - name: GOMEMLIMIT
+        value: 50MiB
+      - name: DB_CONNECTION_STRING
+        valueFrom:
+          secretKeyRef:
+            name: techx-corp-postgresql-app
+            key: product-catalog-db-connection-string
+      - name: OTEL_SEMCONV_STABILITY_OPT_IN
+        value: database
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: http://$(OTEL_COLLECTOR_NAME):4317
+    resources:
+      # 50-user baseline: P95/P99 CPU 19m/20.4m, P99 memory 14.8Mi.
+      requests:
+        cpu: 100m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+    # Hot read path under frontend/checkout; Karpenter spot-tolerant.
+    # Highest backend RPS under Locust browse; RPS primary + CPU safety valve.
+    # maxReplicas 12: load-test pin at 6 with CPU ~126%/70% → desired ~11; +headroom.
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 12
+      targetCPUUtilizationPercentage: 70
+      # Go backend: raised from 100 → 150 RPS/pod (hot browse path).
+      targetRequestsPerSecond: 150
+      behavior: *hpa-behavior-default
+    initContainers: []
+
+  product-reviews:
+    enabled: true
+    serviceAccount:
+      create: true
+      name: product-reviews
+      annotations:
+        eks.amazonaws.com/role-arn: arn:aws:iam::493499579600:role/techx-dev-tf2-product-reviews-model-read
+    modelDelivery:
+      enabled: true
+      awsRegion: us-east-1
+      # aws-cli: download + sha256 only (image has no tar).
+      fetcherImage: public.ecr.aws/aws-cli/aws-cli:2.27.49
+      # busybox: extract verified archive into the model emptyDir.
+      extractorImage: busybox:1.37.0
+      s3Uri: s3://techx-dev-tf2-ai-models-493499579600/protectai/deberta-v3-base-prompt-injection-v2/89b085cd330414d3e7d9dd787870f315957e1e9f/model.tar.gz
+      mountPath: /models/huggingface
+      cacheSizeLimit: 2Gi
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+    useDefault:
+      env: true
+    # Tier B‡ (Python gRPC on 3551 + long LLM RPCs). See probe-thresholds.md.
+    # startupProbe: cover post-init cold bind under CPU pressure after model fetch.
+    # readiness: gRPC health (process can accept work; may fail when worker pool is full).
+    # liveness: tcpSocket so a saturated ThreadPool does not restart a live process
+    # (same pattern as cart vs failedReadinessProbe).
+    startupProbe:
+      grpc:
+        port: 3551
+      periodSeconds: 5
+      timeoutSeconds: 5
+      failureThreshold: 24
+    readinessProbe:
+      grpc:
+        port: 3551
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 3
+    livenessProbe:
+      tcpSocket:
+        port: 3551
+      periodSeconds: 20
+      timeoutSeconds: 3
+      failureThreshold: 5
+    service:
+      port: 3551
+    env:
+      - name: OPENAI_API_KEY
+        valueFrom:
+          secretKeyRef:
+            name: techx-corp-product-reviews
+            key: OPENAI_API_KEY
+      - name: LLM_MODEL
+        value: techx-llm
+      - name: LLM_HOST
+        value: llm
+      - name: LLM_PORT
+        value: "8000"
+      - name: LLM_BASE_URL
+        value: http://$(LLM_HOST):$(LLM_PORT)/v1
+      # Shared with Health/Check; keep above concurrent AskProductAIAssistant depth.
+      - name: GRPC_MAX_WORKERS
+        value: "32"
+      - name: PRODUCT_REVIEWS_PORT
+        value: "3551"
+      - name: PRODUCT_CATALOG_ADDR
+        value: product-catalog:8080
+      - name: FLAGD_HOST
+        value: flagd
+      - name: FLAGD_PORT
+        value: "8013"
+      - name: DB_CONNECTION_STRING
+        valueFrom:
+          secretKeyRef:
+            name: techx-corp-postgresql-app
+            key: product-reviews-db-connection-string
+      - name: PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION
+        value: python
+      - name: OTEL_PYTHON_LOG_CORRELATION
+        value: "true"
+      - name: OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT
+        value: "false"
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: http://$(OTEL_COLLECTOR_NAME):4317
+    resources:
+      # 50-user baseline: P95/P99 CPU 43.4m/50.2m, P99 memory 80.6Mi.
+      # Request/limit raised for OTEL+LLM headroom (was 96Mi/160Mi; probe EOF/OOM risk).
+      requests:
+        cpu: 250m
+        memory: 1Gi
+      limits:
+        cpu: "1"
+        memory: 2Gi
+    # Product-page AI reviews (P1); RPS primary; CPU safety valve.
+    # Lower RPS/pod than recommendation — LLM + Postgres path is heavier.
+    # maxReplicas 6: same band as recommendation until load-test pin data.
+    autoscaling:
+      enabled: true
+      minReplicas: 1
+      maxReplicas: 6
+      targetCPUUtilizationPercentage: 70
+      # LLM + Postgres path: raised from 10 → 20 RPS/pod (less early scale-out).
+      targetRequestsPerSecond: 20
+      behavior: *hpa-behavior-default
+    mountedEmptyDirs:
+      - name: tmp-dir
+        mountPath: /tmp
+    initContainers:
+      - name: wait-for-postgresql
+        image: busybox:1.37.0
+        command:
+          [
+            "sh",
+            "-c",
+            "until nc -z -v -w30 postgresql 5432; do echo waiting for postgresql; sleep 2; done;",
+          ]
+
+  quote:
+    enabled: true
+    useDefault:
+      env: true
+    # Tier B (PHP; no health route → tcp)
+    readinessProbe:
+      tcpSocket:
+        port: 8080
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+    livenessProbe:
+      tcpSocket:
+        port: 8080
+      periodSeconds: 15
+      timeoutSeconds: 5
+      failureThreshold: 5
+    service:
+      port: 8080
+    env:
+      - name: QUOTE_PORT
+        value: "8080"
+      - name: OTEL_PHP_AUTOLOAD_ENABLED
+        value: "true"
+      - name: OTEL_PHP_INTERNAL_METRICS_ENABLED
+        value: "true"
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: http://$(OTEL_COLLECTOR_NAME):4318
+      - name: IPV6_ENABLED
+        value: "false"
+    resources:
+      # kubectl top: 2m CPU, 18Mi mem (PHP). P99 mem: 19Mi.
+      requests:
+        cpu: 50m
+        memory: 32Mi
+      limits:
+        cpu: 250m
+        memory: 128Mi
+    autoscaling:
+      enabled: true
+      minReplicas: 1
+      maxReplicas: 4
+      targetCPUUtilizationPercentage: 70
+      behavior: *hpa-behavior-default
+    mountedEmptyDirs:
+      - name: tmp-dir
+        mountPath: /tmp
+    securityContext:
+      runAsUser: 33 # www-data
+      runAsGroup: 33
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop:
+          - ALL
+
+  recommendation:
+    enabled: true
+    useDefault:
+      env: true
+    # Stateless → Karpenter hard placement
+    schedulingRules: *scheduling-spot-tolerant
+    # Tier B‡ (Python gRPC): readiness timeout 5s — health shares the worker pool
+    # with ListRecommendations; under catalog/load stalls a 3s timeout flapped
+    # NotReady and HPA showed cpu: <unknown> for unready pods.
+    readinessProbe:
+      grpc:
+        port: 8080
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 3
+    livenessProbe:
+      grpc:
+        port: 8080
+      periodSeconds: 15
+      timeoutSeconds: 5
+      failureThreshold: 5
+    service:
+      port: 8080
+    env:
+      - name: RECOMMENDATION_PORT
+        value: "8080"
+      - name: PRODUCT_CATALOG_ADDR
+        value: product-catalog:8080
+      - name: OTEL_PYTHON_LOG_CORRELATION
+        value: "true"
+      - name: PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION
+        value: python
+      - name: FLAGD_HOST
+        value: flagd
+      - name: FLAGD_PORT
+        value: "8013"
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: http://$(OTEL_COLLECTOR_NAME):4317
+      # Shared pool for business RPC + health; default 20 in image (was 10).
+      - name: GRPC_MAX_WORKERS
+        value: "20"
+    resources:
+      # 50-user baseline: P95/P99 CPU 12.8m/13.3m, P99 memory 45.5Mi.
+      # Raised under Locust: top ~180m CPU / thrash OOM risk at 200m/256Mi.
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 400m
+        memory: 384Mi
+    # Product-page traffic (P1); RPS primary; CPU safety valve.
+    autoscaling:
+      enabled: true
+      minReplicas: 1
+      maxReplicas: 6
+      targetCPUUtilizationPercentage: 70
+      # Python recs path: raised from 15 → 25 RPS/pod.
+      targetRequestsPerSecond: 25
+      behavior: *hpa-behavior-default
+    mountedEmptyDirs:
+      - name: tmp-dir
+        mountPath: /tmp
+
+  shipping:
+    enabled: true
+    useDefault:
+      env: true
+    # Tier A (Rust; business routes only → tcp)
+    readinessProbe:
+      tcpSocket:
+        port: 8080
+      periodSeconds: 10
+      timeoutSeconds: 2
+      failureThreshold: 3
+    livenessProbe:
+      tcpSocket:
+        port: 8080
+      periodSeconds: 20
+      timeoutSeconds: 3
+      failureThreshold: 3
+    service:
+      port: 8080
+    env:
+      - name: SHIPPING_PORT
+        value: "8080"
+      - name: QUOTE_ADDR
+        value: http://quote:8080
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: http://$(OTEL_COLLECTOR_NAME):4317
+      - name: IPV6_ENABLED
+        value: "false"
+    resources:
+      # 50-user baseline: P99 CPU 1.53m, P99 memory 3.74Mi.
+      requests:
+        cpu: 50m
+        memory: 16Mi
+      limits:
+        cpu: 200m
+        memory: 64Mi
+    autoscaling:
+      enabled: true
+      minReplicas: 1
+      maxReplicas: 4
+      targetCPUUtilizationPercentage: 70
+      behavior: *hpa-behavior-default
+
+  flagd:
+    enabled: true
+    imageOverride:
+      repository: "ghcr.io/open-feature/flagd"
+      tag: "v0.12.9"
+    useDefault:
+      env: true
+    # Feature-flag control plane → Critical MNG
+    schedulingRules: *scheduling-critical
+    # Tier A (Go flagd RPC port)
+    readinessProbe:
+      tcpSocket:
+        port: 8013
+      periodSeconds: 10
+      timeoutSeconds: 2
+      failureThreshold: 3
+    livenessProbe:
+      tcpSocket:
+        port: 8013
+      periodSeconds: 20
+      timeoutSeconds: 3
+      failureThreshold: 3
+    replicas: 1
+    ports:
+      - name: rpc
+        value: 8013
+      - name: ofrep
+        value: 8016
+    env:
+      - name: FLAGD_METRICS_EXPORTER
+        value: otel
+      - name: FLAGD_OTEL_COLLECTOR_URI
+        value: $(OTEL_COLLECTOR_NAME):4317
+      - name: GOMEMLIMIT
+        value: 100MiB
+    resources:
+      # 50-user baseline: P99 CPU 8.05m, P99 memory 45.5Mi.
+      requests:
+        cpu: 10m
+        memory: 64Mi
+      limits:
+        cpu: 100m
+        memory: 128Mi
+    # Base: local file only (Compose / bare helm without BTC). File content is
+    # local-* team keys only (see flagd/demo.flagd.json); BTC originals come from
+    # prod HTTP source. Prod dual-sources live in values-prod.yaml and
+    # values-flagd-sync.yaml. Keep initContainers + ConfigMap so the file path exists.
+    command:
+      - "/flagd-build"
+      - "start"
+      - "--port"
+      - "8013"
+      - "--ofrep-port"
+      - "8016"
+      - "--uri"
+      - "file:./etc/flagd/demo.flagd.json"
+    mountedEmptyDirs:
+      - name: config-rw
+        mountPath: /etc/flagd
+      - name: tmp-dir
+        mountPath: /tmp
+    # flagd-ui as a sidecar container in the same pod so the flag json file can be shared
+    sidecarContainers:
+      - name: flagd-ui
+        useDefault:
+          env: true
+        service:
+          port: 4000
+        command:
+          - /app/bin/flagd_ui
+          - start
+        env:
+          - name: FLAGD_METRICS_EXPORTER
+            value: otel
+          - name: OTEL_EXPORTER_OTLP_ENDPOINT
+            value: http://$(OTEL_COLLECTOR_NAME):4318
+          - name: FLAGD_UI_PORT
+            value: "4000"
+          - name: SECRET_KEY_BASE
+            valueFrom:
+              secretKeyRef:
+                name: techx-corp-flagd-ui
+                key: SECRET_KEY_BASE
+          - name: PHX_HOST
+            value: localhost
+          - name: PHX_SERVER
+            value: "true"
+        resources:
+          # 50-user baseline: P99 CPU 0.242m, P99 memory 137Mi.
+          requests:
+            cpu: 5m
+            memory: 160Mi
+          limits:
+            cpu: 50m
+            memory: 256Mi
+        securityContext:
+          runAsUser: 10001
+          runAsGroup: 10001
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+              - ALL
+        volumeMounts:
+          - name: config-rw
+            mountPath: /app/data
+          - name: tmp-dir
+            mountPath: /tmp
+    initContainers:
+      - name: init-config
+        image: busybox:1.37.0
+        command:
+          [
+            "sh",
+            "-c",
+            "cp /config-ro/demo.flagd.json /config-rw/demo.flagd.json && cat /config-rw/demo.flagd.json",
+          ]
+        volumeMounts:
+          - mountPath: /config-ro
+            name: config-ro
+          - mountPath: /config-rw
+            name: config-rw
+    additionalVolumes:
+      - name: config-ro
+        configMap:
+          name: flagd-config
+
+  kafka:
+    enabled: true
+    stateful: true
+    # Critical data plane → Critical MNG (system-*); no Karpenter toleration
+    schedulingRules: *scheduling-critical
+    podSecurityContext:
+      fsGroup: 1000
+    terminationGracePeriodSeconds: 60
+    useDefault:
+      env: true
+    # NOTE: Singleton data/broker component. Non-surge rollout is used because it relies on single-writer / non-HA storage, which does not support zero-downtime rolling updates.
+    rollout:
+      strategy:
+        type: RollingUpdate
+        rollingUpdate:
+          maxUnavailable: 1
+          maxSurge: 0
+    # Tier C (JVM + OTEL agent, Guaranteed 200m CPU). Without startupProbe, liveness
+    # counts connection-refused during KRaft bootstrap and restarts mid-boot.
+    # Unhealthy "connection refused" Events until the first successful TCP probe are expected.
+    startupProbe:
+      tcpSocket:
+        port: 9092
+      initialDelaySeconds: 20
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 36 # ~6.2 minutes after start (20s + 36*10s)
+    readinessProbe:
+      tcpSocket:
+        port: 9092
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 3
+    livenessProbe:
+      tcpSocket:
+        port: 9092
+      periodSeconds: 30
+      timeoutSeconds: 5
+      failureThreshold: 5
+    replicas: 1
+    ports:
+      - name: plaintext
+        value: 9092
+      - name: controller
+        value: 9093
+    env:
+      - name: KAFKA_ADVERTISED_LISTENERS
+        value: PLAINTEXT://kafka:9092
+      - name: OTEL_EXPORTER_OTLP_ENDPOINT
+        value: http://$(OTEL_COLLECTOR_NAME):4318
+      - name: KAFKA_HEAP_OPTS
+        value: "-Xmx400M -Xms400M"
+      - name: KAFKA_LISTENERS
+        value: PLAINTEXT://:9092,CONTROLLER://:9093
+      - name: KAFKA_CONTROLLER_LISTENER_NAMES
+        value: CONTROLLER
+      - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+        value: 1@127.0.0.1:9093
+      - name: KAFKA_LOG_DIRS
+        value: /opt/kafka/data/kafka
+    resources:
+      # 50-user baseline: P99 CPU 21.6m, P99 memory 560Mi. KAFKA_HEAP_OPTS=-Xmx400M.
+      requests:
+        cpu: 50m
+        memory: 640Mi
+      limits:
+        cpu: 300m
+        memory: 768Mi
+    securityContext:
+      runAsUser: 1000 # appuser
+      runAsGroup: 1000
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: false
+      capabilities:
+        drop:
+          - ALL
+    volumeClaimTemplates:
+      - metadata:
+          name: kafka-data
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          storageClassName: "{{ .defaultValues.storageClassName }}"
+          resources:
+            requests:
+              storage: 5Gi
+    additionalVolumeMounts:
+      - name: kafka-data
+        mountPath: /opt/kafka/data
+
+  llm:
+    enabled: true
+    useDefault:
+      env: true
+    # Tier B (Flask; no health route → tcp)
+    readinessProbe:
+      tcpSocket:
+        port: 8000
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+    livenessProbe:
+      tcpSocket:
+        port: 8000
+      periodSeconds: 15
+      timeoutSeconds: 5
+      failureThreshold: 5
+    service:
+      port: 8000
+    env:
+      - name: FLAGD_HOST
+        value: flagd
+      - name: FLAGD_PORT
+        value: "8013"
+    resources:
+      # 50-user baseline: P99 CPU 7.24m, P99 memory 71.5Mi.
+      requests:
+        cpu: 10m
+        memory: 96Mi
+      limits:
+        cpu: 200m
+        memory: 192Mi
+
+  postgresql:
+    enabled: true
+    stateful: true
+    schedulingRules: *scheduling-critical
+    podSecurityContext:
+      fsGroup: 999
+    terminationGracePeriodSeconds: 60
+    useDefault:
+      env: false
+    # NOTE: Singleton data/broker component. Non-surge rollout is used because it relies on single-writer / non-HA storage, which does not support zero-downtime rolling updates.
+    rollout:
+      strategy:
+        type: RollingUpdate
+        rollingUpdate:
+          maxUnavailable: 1
+          maxSurge: 0
+    # Tier C (Guaranteed 100m CPU; compose uses timeout 5 / multi-retry)
+    readinessProbe:
+      tcpSocket:
+        port: 5432
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 6
+    livenessProbe:
+      tcpSocket:
+        port: 5432
+      periodSeconds: 20
+      timeoutSeconds: 5
+      failureThreshold: 5
+    imageOverride:
+      repository: "postgres"
+      tag: "17.6"
+    # Keep entrypoint so init scripts still run; raise slots for multi-replica apps.
+    # Default 100 was exhausted under product-catalog HPA (idle slots ~70+, errors:
+    # "remaining connection slots are reserved for roles with the SUPERUSER attribute").
+    command:
+      - docker-entrypoint.sh
+      - postgres
+      - -c
+      - max_connections=200
+    replicas: 1
+    service:
+      port: 5432
+    podAnnotations:
+      io.opentelemetry.discovery.metrics/enabled: "true"
+      io.opentelemetry.discovery.metrics/scraper: postgresql
+      # RESIDUAL (SEC-05): OTel scrape config cannot use secretKeyRef; keep in sync with
+      # postgresql-admin password after rotation, or disable metrics scrape. Tracked for follow-up.
+      io.opentelemetry.discovery.metrics/config: |
+        username: root
+        password: otel
+        metrics:
+          postgresql.blks_hit:
+            enabled: true
+          postgresql.blks_read:
+            enabled: true
+          postgresql.tup_fetched:
+            enabled: true
+          postgresql.tup_returned:
+            enabled: true
+          postgresql.tup_inserted:
+            enabled: true
+          postgresql.tup_updated:
+            enabled: true
+          postgresql.tup_deleted:
+            enabled: true
+          postgresql.deadlocks:
+            enabled: true
+        tls:
+          insecure: true
+    env:
+      - name: POSTGRES_USER
+        valueFrom:
+          secretKeyRef:
+            name: techx-corp-postgresql-admin
+            key: POSTGRES_USER
+      - name: POSTGRES_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: techx-corp-postgresql-admin
+            key: POSTGRES_PASSWORD
+      - name: POSTGRES_DB
+        valueFrom:
+          secretKeyRef:
+            name: techx-corp-postgresql-admin
+            key: POSTGRES_DB
+      - name: PGDATA
+        value: /var/lib/postgresql/data/pgdata
+    mountedConfigMaps:
+      - name: postgresql-init
+        mountPath: /docker-entrypoint-initdb.d
+        existingConfigMap: postgresql-init
+    resources:
+      # 50-user baseline: P95/P99 CPU 52.7m/72.5m, P99 memory 50Mi.
+      # Load-test: top ~402m CPU / 133Mi mem at default 400m/256Mi; raise for 200 conns.
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 1000m
+        memory: 512Mi
+    securityContext:
+      runAsUser: 999
+      runAsGroup: 999
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: false
+      capabilities:
+        drop:
+          - ALL
+    volumeClaimTemplates:
+      - metadata:
+          name: postgresql-data
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          storageClassName: "{{ .defaultValues.storageClassName }}"
+          resources:
+            requests:
+              storage: 5Gi
+    additionalVolumeMounts:
+      - name: postgresql-data
+        mountPath: /var/lib/postgresql/data
+
+  valkey-cart:
+    enabled: true
+    stateful: true
+    schedulingRules: *scheduling-critical
+    podSecurityContext:
+      fsGroup: 1000
+    terminationGracePeriodSeconds: 60
+    useDefault:
+      env: false
+    # NOTE: Singleton data/broker component. Non-surge rollout is used because it relies on single-writer / non-HA storage, which does not support zero-downtime rolling updates.
+    rollout:
+      strategy:
+        type: RollingUpdate
+        rollingUpdate:
+          maxUnavailable: 1
+          maxSurge: 0
+    # Tier A (fast cache bind)
+    readinessProbe:
+      tcpSocket:
+        port: 6379
+      periodSeconds: 10
+      timeoutSeconds: 2
+      failureThreshold: 3
+    livenessProbe:
+      tcpSocket:
+        port: 6379
+      periodSeconds: 20
+      timeoutSeconds: 3
+      failureThreshold: 3
+    imageOverride:
+      repository: "valkey/valkey"
+      tag: "9.0.1-alpine3.23"
+    replicas: 1
+    ports:
+      - name: valkey-cart
+        value: 6379
+    podAnnotations:
+      io.opentelemetry.discovery.metrics/enabled: "true"
+      io.opentelemetry.discovery.metrics/scraper: redis
+      io.opentelemetry.discovery.metrics/config: |
+        username: valkey
+        collection_interval: 10s
+    resources:
+      # 50-user baseline: P99 CPU 5.05m, P99 memory 7.33Mi; leave burst/OOM headroom.
+      requests:
+        cpu: 10m
+        memory: 16Mi
+      limits:
+        cpu: 100m
+        memory: 32Mi
+    securityContext:
+      runAsUser: 999 # valkey
+      runAsGroup: 1000
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: false
+      capabilities:
+        drop:
+          - ALL
+    mountedConfigMaps:
+      - name: valkey-cart-config
+        mountPath: /etc/valkey
+        data:
+          valkey.conf: |
+            appendonly yes
+            appendfsync everysec
+            save 60 100
+            save 300 10
+            maxmemory 32mb
+            maxmemory-policy allkeys-lru
+            loglevel notice
+    command: ["valkey-server", "/etc/valkey/valkey.conf"]
+    volumeClaimTemplates:
+      - metadata:
+          name: valkey-cart-data
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          storageClassName: "{{ .defaultValues.storageClassName }}"
+          resources:
+            requests:
+              storage: 2Gi
+    additionalVolumeMounts:
+      - name: valkey-cart-data
+        mountPath: /data
+
+  # Custom platform image: default.image.repository/opensearch:default.image.tag
+  # (src/opensearch/Dockerfile — strips unused plugins). No separate image override.
+  opensearch:
+    enabled: true
+    stateful: true
+    schedulingRules: *scheduling-critical
+    podSecurityContext:
+      fsGroup: 1000
+      runAsUser: 1000
+    terminationGracePeriodSeconds: 60
+    useDefault:
+      env: false
+    # Singleton search node; non-surge rollout (single-writer data path).
+    rollout:
+      strategy:
+        type: RollingUpdate
+        rollingUpdate:
+          maxUnavailable: 1
+          maxSurge: 0
+    # Cold start is JVM-heavy: on 200m CPU, :9200 often binds only after ~4+ minutes
+    # (observed ~4m16s). CPU request 500m shortens bootstrap; startupProbe still
+    # gates liveness so kubelet does not kill mid-bootstrap if the node is busy.
+    # Unhealthy "connection refused" events during the first few minutes are expected
+    # until the first successful TCP probe; they do not mean the process crashed.
+    startupProbe:
+      tcpSocket:
+        port: 9200
+      initialDelaySeconds: 30
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 36 # ~6.5 minutes after start (30s + 36*10s)
+    readinessProbe:
+      tcpSocket:
+        port: 9200
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 3
+    livenessProbe:
+      tcpSocket:
+        port: 9200
+      periodSeconds: 30
+      timeoutSeconds: 5
+      failureThreshold: 5
+    replicas: 1
+    ports:
+      - name: http
+        value: 9200
+      - name: transport
+        value: 9300
+    env:
+      - name: OPENSEARCH_JAVA_OPTS
+        value: "-Xms400m -Xmx400m"
+      - name: discovery.type
+        value: single-node
+      # K8s pods lack memlock ulimit / IPC_LOCK; memory_lock=true can fail bootstrap.
+      - name: bootstrap.memory_lock
+        value: "false"
+      # SEC-06: Security plugin is enabled (DISABLE_SECURITY_PLUGIN removed).
+      # The security plugin requires TLS material at bootstrap. For this single-node
+      # log store we install OpenSearch demo certs (self-signed) so the plugin can
+      # load; clients use HTTPS with tls.insecure / skip-verify on the cluster network.
+      # Setting this to "true" without mounting custom PEM certs causes:
+      #   OpenSearchException[No SSL configuration found]
+      #   → CrashLoopBackOff (failed to load OpenSearchSecurityPlugin).
+      - name: DISABLE_INSTALL_DEMO_CONFIG
+        value: "false"
+      # Admin password is injected via OPENSEARCH_INITIAL_ADMIN_PASSWORD from K8s Secret
+      # techx-corp-opensearch (ESO-synced from ASM techx-corp/*/opensearch).
+      # Must meet OpenSearch strength rules: ≥8 chars, upper, lower, digit, special.
+      # This env bootstraps the built-in admin user on first node start; PVC persists it.
+      - name: OPENSEARCH_INITIAL_ADMIN_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: techx-corp-opensearch
+            key: OPENSEARCH_INITIAL_ADMIN_PASSWORD
+      - name: cluster.name
+        value: demo-cluster
+      - name: network.host
+        value: "0.0.0.0"
+    resources:
+      # 50-user baseline: P99 CPU 70.1m, P99 memory 730Mi.
+      # OPENSEARCH_JAVA_OPTS=-Xms400m -Xmx400m.
+      # Keep a 500m CPU limit for JVM bootstrap while reducing scheduling reservation.
+      requests:
+        cpu: 100m
+        memory: 800Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+    securityContext:
+      runAsUser: 1000
+      runAsGroup: 1000
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: false
+      capabilities:
+        drop:
+          - ALL
+    volumeClaimTemplates:
+      - metadata:
+          name: opensearch-data
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          storageClassName: "{{ .defaultValues.storageClassName }}"
+          resources:
+            requests:
+              storage: 10Gi
+    additionalVolumeMounts:
+      - name: opensearch-data
+        mountPath: /usr/share/opensearch/data
+    mountedEmptyDirs:
+      - name: tmp-dir
+        mountPath: /tmp
+
+opentelemetry-collector:
+  enabled: true
+  # Universal DaemonSet: run on Critical MNG and Karpenter (no workload-class selector).
+  tolerations:
+    - key: workload-class
+      operator: Equal
+      value: spot-tolerant
+      effect: NoSchedule
+  podSecurityContext:
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    runAsNonRoot: true
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+  image:
+    repository: "otel/opentelemetry-collector-contrib"
+  fullnameOverride: otel-collector
+  mode: daemonset
+  presets:
+    # Disabled: hostmetrics + root_path /hostfs blocked otelcol in D-state (disk sleep) on
+    # packed Critical MNG nodes, so :13133 never opened and probes saw connection refused.
+    # Re-enable only with narrowed scrapers after Critical MNG capacity is healthy.
+    hostMetrics:
+      enabled: false
+    kubernetesAttributes:
+      enabled: true
+    kubeletMetrics:
+      enabled: true
+    clusterMetrics:
+      enabled: true
+    annotationDiscovery:
+      metrics:
+        enabled: true
+  # Packed Critical MNG nodes (t4g.medium ~96% mem) could not finish startup under 200Mi:
+  # health :13133 stayed closed or hung → readiness/liveness connection refused → restart storm.
+  # Healthy agents already sit ~110–150Mi; leave headroom + raise GOMEMLIMIT (80% of limit).
+  resources:
+    # kubectl top: 5-31m CPU per agent, 90-120Mi mem per agent (5 DaemonSet pods).
+    # P99 per-pod mem: ~120Mi. 50m CPU request; 150Mi memory request (120Mi × 1.25).
+    requests:
+      cpu: 50m
+      memory: 150Mi
+    limits:
+      cpu: 400m
+      memory: 300Mi
+  # Block liveness until health extension is serving (slow start under node memory pressure).
+  startupProbe:
+    httpGet:
+      path: /
+      port: 13133
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 36
+  livenessProbe:
+    httpGet:
+      path: /
+      port: 13133
+    initialDelaySeconds: 0
+    periodSeconds: 20
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readinessProbe:
+    httpGet:
+      path: /
+      port: 13133
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 6
+  service:
+    enabled: true
+  ports:
+    metrics:
+      enabled: true
+  # SEC-06: OpenSearch basic auth credentials injected from ESO-synced Secret.
+  # Used by the basicauth/opensearch extension in the collector config below.
+  extraEnvs:
+    - name: OPENSEARCH_USERNAME
+      valueFrom:
+        secretKeyRef:
+          name: techx-corp-opensearch
+          key: username
+    - name: OPENSEARCH_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: techx-corp-opensearch
+          key: password
+  config:
+    receivers:
+      otlp:
+        protocols:
+          http:
+            # Since this collector needs to receive data from the web, enable cors for all origins
+            # `allowed_origins` can be refined for your deployment domain
+            cors:
+              allowed_origins:
+                - "http://*"
+                - "https://*"
+      kafkametrics:
+        scrapers:
+          - brokers
+          - topics
+          - consumers
+        brokers:
+          - kafka:9092
+        collection_interval: 10s
+    exporters:
+      otlp/jaeger:
+        endpoint: jaeger:4317
+        tls:
+          insecure: true
+        retry_on_failure:
+          enabled: true
+          initial_interval: 1s
+          max_interval: 30s
+          max_elapsed_time: 300s
+        sending_queue:
+          enabled: true
+          num_consumers: 4
+          queue_size: 2048
+      otlphttp/prometheus:
+        endpoint: http://prometheus:9090/api/v1/otlp
+        tls:
+          insecure: true
+        retry_on_failure:
+          enabled: true
+          initial_interval: 1s
+          max_interval: 30s
+          max_elapsed_time: 300s
+        sending_queue:
+          enabled: true
+          num_consumers: 4
+          queue_size: 2048
+      opensearch:
+        logs_index: otel-logs
+        logs_index_time_format: "yyyy-MM-dd"
+        http:
+          # SEC-06: security plugin serves HTTPS (demo self-signed certs on single-node).
+          endpoint: https://opensearch:9200
+          tls:
+            insecure: true
+          # SEC-06: basic auth credentials from ESO-synced Secret techx-corp-opensearch.
+          # The otel-collector DaemonSet mounts these via secretKeyRef (see below).
+          auth:
+            authenticator: basicauth/opensearch
+        retry_on_failure:
+          enabled: true
+          initial_interval: 1s
+          max_interval: 30s
+          max_elapsed_time: 300s
+        sending_queue:
+          enabled: true
+          num_consumers: 4
+          queue_size: 2048
+
+    processors:
+      memory_limiter:
+        check_interval: 5s
+        limit_percentage: 80
+        spike_limit_percentage: 25
+      batch:
+        timeout: 5s
+        send_batch_size: 1024
+        send_batch_max_size: 2048
+      resourcedetection:
+        detectors: [env, system]
+      transform:
+        error_mode: ignore
+        trace_statements:
+          # Sanitize spans to prevent span metrics cardinality explosion
+          # caused by non-compliant high cardinality span names:
+          # 1. Define missing http.route on key HTTP operations for meaningful operation names
+          # 2. Then normalize span names; http server spans lacking http.route default to operations "GET", "POST", etc.
+          - context: span
+            # FRONTEND SERVICE
+            conditions:
+              - span.kind == SPAN_KIND_SERVER and resource.attributes["service.name"] == "frontend" and span.attributes["http.route"] == nil
+            statements:
+              # Workaround for Next.js high cardinality span name issue: https://github.com/vercel/next.js/issues/54694
+              - set(span.attributes["http.route"], "/api/cart") where IsMatch(span.attributes["http.target"], "\\/api\\/cart") # e.g. # /api/cart
+              - set(span.attributes["http.route"], "/api/checkout") where IsMatch(span.attributes["http.target"], "\\/api\\/checkout") # e.g. # /api/checkout
+              - set(span.attributes["http.route"], "/api/products/{productId}") where IsMatch(span.attributes["http.target"], "\\/api\\/products\\/.*") # e.g. /api/products/1YMWWN1N4O
+              - set(span.attributes["http.route"], "/api/recommendations") where IsMatch(span.attributes["http.target"], "\\/api\\/recommendations") # e.g. # /api/recommendations?productIds=...
+              - set(span.attributes["http.route"], "/api/data") where IsMatch(span.attributes["http.target"], "\\/api\\/data.*") # e.g. # " /api/data?contextKeys=telescopes" or /api/data/?contextKeys=cameras
+          - context: span
+            statements:
+              # SANITIZE ALL SPAN NAMES TO PREVENT CARDINALITY EXPLOSION
+              - set_semconv_span_name("1.37.0", "unsanitized_span_name")
+      # APM Dashboard filters on these resource attributes (promoted to Prometheus
+      # labels via promote_resource_attributes). Defaults match production; override
+      # in values-dev.yaml (development / techx-corp-dev). Without them Grafana shows
+      # <<not defined>> and empty service lists.
+      resource:
+        attributes:
+          - key: service.instance.id
+            from_attribute: k8s.pod.uid
+            action: insert
+          - key: deployment.environment.name
+            value: production
+            action: upsert
+          - key: service.namespace
+            value: techx-corp-prod
+            action: upsert
+
+    connectors:
+      # The default 60s flush interval leaves fewer than two samples in the
+      # Prometheus Adapter rate window, so the HPA sees 0 RPS under load.
+      spanmetrics:
+        metrics_flush_interval: 15s
+
+    extensions:
+      health_check: {}
+      # SEC-06: BasicAuth extension for OpenSearch exporter.
+      # Credentials are injected via env vars from K8s Secret techx-corp-opensearch.
+      basicauth/opensearch:
+        client_auth:
+          username: ${env:OPENSEARCH_USERNAME}
+          password: ${env:OPENSEARCH_PASSWORD}
+
+    service:
+      extensions: [basicauth/opensearch, health_check]
+      pipelines:
+        traces:
+          processors:
+            [memory_limiter, resourcedetection, resource, transform, batch]
+          exporters: [otlp/jaeger, debug, spanmetrics]
+        metrics:
+          receivers: [otlp, kafkametrics, spanmetrics]
+          processors: [memory_limiter, resourcedetection, resource, batch]
+          exporters: [otlphttp/prometheus, debug]
+        logs:
+          processors: [memory_limiter, resourcedetection, resource, batch]
+          exporters: [opensearch, debug]
+      telemetry:
+        metrics:
+          # detailed self-metrics + OTLP export amplified load on small Critical MNG agents.
+          level: basic
+          readers:
+            - periodic:
+                interval: 10000
+                timeout: 5000
+                exporter:
+                  otlp:
+                    protocol: http/protobuf
+                    endpoint: http://otel-collector:4318
+                    insecure: true
+
+jaeger:
+  enabled: true
+  fullnameOverride: jaeger
+  jaeger:
+    # Observability control plane → Critical MNG
+    nodeSelector:
+      workload-class: critical
+    podSecurityContext:
+      seccompProfile:
+        type: RuntimeDefault
+    securityContext:
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop:
+          - ALL
+    storage:
+      type: memory
+    extraEnv:
+      # Cap in-memory backend size so multi-service OTLP ingest cannot grow past the cgroup limit.
+      # 25000 traces under load exceeded 1536Mi (~6 min) and OOMKilled (exit 137 / CrashLoopBackOff).
+      - name: MEMORY_MAX_TRACES
+        value: "10000"
+      - name: PROMETHEUS_ADDR
+        value: prometheus:9090
+      - name: OTEL_COLLECTOR_HOST
+        value: otel-collector
+      - name: OTEL_COLLECTOR_PORT_HTTP
+        value: "4318"
+      - name: JAEGER_HOST
+        value: "0.0.0.0"
+      - name: JAEGER_GRPC_PORT
+        value: "4317"
+    resources:
+      # In-memory storage under continuous OTLP: OOM at 1536Mi with 25k max_traces.
+      # Request kept moderate for Critical MNG packing on t4g.large; limit matches Prometheus headroom.
+      requests:
+        cpu: 50m
+        memory: 1Gi
+      limits:
+        cpu: 500m
+        memory: 3Gi
+  userconfig:
+    service:
+      extensions: [jaeger_storage, jaeger_query, healthcheckv2]
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [jaeger_storage_exporter]
+      telemetry:
+        resource:
+          service.name: jaeger
+        metrics:
+          level: detailed
+          readers:
+            - periodic:
+                interval: 10000
+                timeout: 5000
+                exporter:
+                  otlp:
+                    protocol: http/protobuf
+                    endpoint: http://${env:OTEL_COLLECTOR_HOST}:${env:OTEL_COLLECTOR_PORT_HTTP}
+                    insecure: true
+        logs:
+          level: info
+    extensions:
+      healthcheckv2:
+        use_v2: true
+        http:
+          endpoint: 0.0.0.0:13133
+      jaeger_query:
+        storage:
+          traces: memory_backend
+          metrics: metrics_backend
+        base_path: /jaeger/ui
+      jaeger_storage:
+        backends:
+          memory_backend:
+            memory:
+              max_traces: ${env:MEMORY_MAX_TRACES}
+        metric_backends:
+          metrics_backend:
+            prometheus:
+              endpoint: "http://${env:PROMETHEUS_ADDR}"
+              normalize_calls: true
+              normalize_duration: true
+
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: ${env:JAEGER_HOST}:${env:JAEGER_GRPC_PORT}
+
+    processors:
+      batch:
+        timeout: 5s
+        send_batch_size: 1024
+        send_batch_max_size: 2048
+
+    exporters:
+      jaeger_storage_exporter:
+        trace_storage: memory_backend
+
+prometheus:
+  enabled: true
+  alertmanager:
+    enabled: false
+  configmapReload:
+    prometheus:
+      enabled: false
+  kube-state-metrics:
+    enabled: true
+    # Expose only the node-placement labels required by capacity alerts.
+    metricLabelsAllowlist:
+      - nodes=[workload-class,karpenter.sh/nodepool,karpenter.sh/capacity-type,topology.kubernetes.io/zone]
+    resources:
+      # 50-user baseline: P99 CPU 1.90m, P99 memory 31.3Mi.
+      requests:
+        cpu: 5m
+        memory: 40Mi
+      limits:
+        cpu: 100m
+        memory: 64Mi
+  prometheus-node-exporter:
+    enabled: false
+  prometheus-pushgateway:
+    enabled: false
+  # Karpenter exposes controller, scheduler, NodePool usage/limit, and
+  # cluster-state metrics on the in-cluster http-metrics service port.
+  extraScrapeConfigs: |
+    - job_name: karpenter
+      static_configs:
+        - targets:
+            - karpenter.kube-system.svc.cluster.local:8080
+  server:
+    fullnameOverride: prometheus
+    # Observability control plane → Critical MNG
+    nodeSelector:
+      workload-class: critical
+    extraFlags:
+      - "enable-feature=exemplar-storage"
+      - "web.enable-otlp-receiver"
+    # emptyDir TSDB: keep retention short so WAL/replay stays bounded on restart.
+    retention: 2d
+    tsdb:
+      out_of_order_time_window: 30m
+    otlp:
+      keep_identifying_resource_attributes: true
+      # Recommended attributes to be promoted to labels.
+      promote_resource_attributes:
+        - service.instance.id
+        - service.name
+        - service.namespace
+        - service.version
+        - cloud.availability_zone
+        - cloud.region
+        - deployment.environment.name
+        # When deploying on Kubernetes, resource attributes used to identify the
+        # kubernetes resources in dashboards and alerts.
+        - k8s.cluster.name
+        - k8s.container.name
+        - k8s.cronjob.name
+        - k8s.daemonset.name
+        - k8s.deployment.name
+        - k8s.job.name
+        - k8s.namespace.name
+        - k8s.node.name
+        - k8s.pod.name
+        - k8s.replicaset.name
+        - k8s.statefulset.name
+        - container.name
+        # When deploying on VMs, resource attributes used to identify
+        # the host in dashboards and alerts.
+        - host.name
+        # PostgreSQL resource attributes produced by the OTel Collector PostgreSQL receiver
+        # and used in dashboards and alerts.
+        # See https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/receiver/postgresqlreceiver/metadata.yaml
+        - postgresql.database.name
+        - postgresql.schema.name
+        - postgresql.table.name
+        - postgresql.index.name
+    persistentVolume:
+      enabled: true
+      storageClass: gp2
+      size: 8Gi
+    service:
+      servicePort: 9090
+    # PVC + OTLP + exemplars: WAL replay (~50s) and head block exceed the former
+    # 2Gi limit (OOMKilled exit 137 / CrashLoop). Request stays below Critical
+    # t4g.large packing pressure; limit covers replay spikes.
+    resources:
+      # 50-user baseline steady ~1.04Gi; prod WAL replay + OTLP needs higher ceiling.
+      requests:
+        cpu: 100m
+        memory: 1536Mi
+      limits:
+        cpu: "1"
+        memory: 3Gi
+    # WAL/config load observed ~50s under load; block liveness until ready.
+    startupProbe:
+      enabled: true
+      periodSeconds: 10
+      failureThreshold: 36
+      timeoutSeconds: 10
+    readinessProbeInitialDelay: 10
+    readinessProbePeriodSeconds: 10
+    readinessProbeTimeout: 10
+    readinessProbeFailureThreshold: 3
+    readinessProbeSuccessThreshold: 1
+    livenessProbeInitialDelay: 30
+    livenessProbePeriodSeconds: 20
+    livenessProbeTimeout: 10
+    livenessProbeFailureThreshold: 3
+    livenessProbeSuccessThreshold: 1
+    securityContext:
+      runAsUser: 65534
+      runAsNonRoot: true
+      runAsGroup: 65534
+      fsGroup: 65534
+      seccompProfile:
+        type: RuntimeDefault
+    containerSecurityContext:
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop:
+          - ALL
+
+grafana:
+  enabled: true
+  fullnameOverride: grafana
+  # The persistent storage uses fsGroup 472; the root/CHOWN init container is unnecessary.
+  initChownData:
+    enabled: false
+  deploymentStrategy:
+    type: Recreate
+  # Observability control plane → Critical MNG
+  nodeSelector:
+    workload-class: critical
+  extraEmptyDirMounts:
+    - name: grafana-tmp
+      mountPath: /tmp
+  testFramework:
+    enabled: false
+  grafana.ini:
+    # SEC-02: require login, disable anonymous access (no anonymous Admin)
+    auth:
+      disable_login_form: false
+    auth.anonymous:
+      enabled: false
+    # Keep "Skip" available on the change-password screen if password is still "admin".
+    # Grafana has NO ini flag to hide that screen; the UI hardcodes it when the typed
+    # password is the literal string "admin" (see LoginCtrl.tsx). To fully remove the
+    # interstitial, set admin-password in ASM .../grafana to anything other than "admin".
+    auth.basic:
+      password_policy: false
+    server:
+      root_url: "%(protocol)s://%(domain)s:%(http_port)s/grafana"
+      serve_from_sub_path: true
+  # SEC-05: admin credentials from ESO Secret techx-corp-grafana-admin
+  # Do NOT use admin-password value "admin" — Grafana always shows change-password UI then.
+  admin:
+    existingSecret: techx-corp-grafana-admin
+    userKey: admin-user
+    passwordKey: admin-password
+  # SEC-06: OpenSearch basic auth credentials injected into Grafana container env.
+  # Used by the provisioned opensearch.yaml datasource (${OPENSEARCH_USERNAME} / ${OPENSEARCH_PASSWORD}).
+  envValueFrom:
+    OPENSEARCH_USERNAME:
+      secretKeyRef:
+        name: techx-corp-opensearch
+        key: username
+    OPENSEARCH_PASSWORD:
+      secretKeyRef:
+        name: techx-corp-opensearch
+        key: password
+    # Discord alert webhook — used by grafana/provisioning/alerting/contact-points.yaml
+    # Secret quản lý qua AWS Secrets Manager + ESO (secrets-chart).
+    # ASM path: techx-corp/production/grafana-discord → {"webhook-url":"<url>"}
+    # K8s Secret techx-corp-grafana-discord được ESO tạo tự động.
+    DISCORD_WEBHOOK_URL:
+      secretKeyRef:
+        name: techx-corp-grafana-discord
+        key: webhook-url
+    # AIOps inbound Grafana webhook auth — used by grafana/provisioning/alerting/contact-points.yaml.
+    # ASM path: techx-corp/production/aiops-grafana-webhook → {"AIOPS_GRAFANA_WEBHOOK_SECRET":"<secret>"}
+    # K8s Secret techx-corp-aiops-grafana-webhook được ESO tạo tự động.
+    AIOPS_GRAFANA_WEBHOOK_SECRET:
+      secretKeyRef:
+        name: techx-corp-aiops-grafana-webhook
+        key: AIOPS_GRAFANA_WEBHOOK_SECRET
+  env:
+    AIOPS_GRAFANA_WEBHOOK_URL: http://aiops-runtime:8080/api/v1/events/grafana
+  plugins:
+    - grafana-opensearch-datasource
+    - grafana-athena-datasource
+  sidecar:
+    alerts:
+      enabled: true
+      # Avoid runtime reload through Grafana admin API.
+      # The live cluster has shown 401 on /api/admin/provisioning/alerting/reload
+      # when the persisted Grafana admin password drifts from the Kubernetes Secret.
+      # Init mode makes alert provisioning deterministic on Grafana pod rollout.
+      skipReload: true
+      initAlerts: true
+    dashboards:
+      enabled: true
+    datasources:
+      enabled: true
+      # Datasources must exist before Grafana's startup provisioning pass.
+      # The reload endpoint depends on the admin Secret matching Grafana's
+      # database password; use init provisioning so Athena is loaded even when
+      # the sidecar hot-reload call is rejected after a password reset.
+      initDatasources: true
+      watchMethod: LIST
+      skipReload: true
+    resources:
+      # kubectl top sidecars: sc-alerts ~74Mi, sc-dashboard ~75Mi, sc-datasources ~73Mi each.
+      # P99 per sidecar: ~75Mi. 80Mi request per sidecar is sufficient.
+      requests:
+        cpu: 5m
+        memory: 80Mi
+      limits:
+        cpu: 100m
+        memory: 128Mi
+  resources:
+    # 50-user baseline: P99 CPU 36.5m, P99 memory 554Mi for the main container.
+    requests:
+      cpu: 50m
+      memory: 640Mi
+    limits:
+      cpu: 300m
+      memory: 1Gi
+  persistence:
+    enabled: true
+    storageClassName: gp2
+    size: 1Gi
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 472
+    runAsGroup: 472
+    fsGroup: 472
+    seccompProfile:
+      type: RuntimeDefault
+  containerSecurityContext:
+    runAsNonRoot: true
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+
+# Metrics Server — required for HPA (autoscaling/v2 CPU metrics; memory optional).
+# Set enabled: false if the cluster already runs metrics-server (e.g. kube-system).
+metrics-server:
+  enabled: true
+  fullnameOverride: metrics-server
+  # HPA dependency — pin to critical MNG floor
+  nodeSelector:
+    workload-class: critical
+  # EKS / many managed node groups: kubelet serving certs are not trusted by default.
+  args:
+    - --kubelet-insecure-tls
+  resources:
+    # kubectl top: 5m CPU, 29Mi mem. P99 mem: 29.5Mi. HPA dependency — keep lean.
+    requests:
+      cpu: 10m
+      memory: 40Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
+
+# Prometheus Adapter — custom/external metrics API for request-rate (RPS) HPA.
+# Reads OTel request counters already scraped into in-cluster Prometheus.
+# Set enabled: false to fall back to CPU-only HPA (targets stay in values but External metrics fail closed).
+# Ops: docs/operations/request-metric-hpa.md
+prometheus-adapter:
+  enabled: true
+  fullnameOverride: prometheus-adapter
+  # Same Critical floor as metrics-server / Prometheus (APIService reliability).
+  nodeSelector:
+    workload-class: critical
+  prometheus:
+    # In-release Prometheus (server.fullnameOverride: prometheus).
+    url: http://prometheus
+    port: 9090
+  # Resource metrics remain Metrics Server; disable adapter default resource rules.
+  rules:
+    default: false
+    # External metrics: total RPS by service_name (OTel / spanmetrics).
+    # HPA External + AverageValue divides by current replica count → per-pod target.
+    external:
+      # gRPC backends (product-catalog, cart, currency, checkout, recommendation, …)
+      - seriesQuery: 'rpc_server_duration_milliseconds_count{service_name!=""}'
+        resources:
+          namespaced: false
+        name:
+          matches: ".*"
+          as: "http_requests_per_second"
+        metricsQuery: 'sum(rate(<<.Series>>{<<.LabelMatchers>>}[2m])) by (service_name) or (sum(<<.Series>>{<<.LabelMatchers>>} * 0) by (service_name))'
+      # HTTP server metrics (frontend Next.js and other HTTP services)
+      - seriesQuery: 'http_server_duration_milliseconds_count{service_name!=""}'
+        resources:
+          namespaced: false
+        name:
+          matches: ".*"
+          as: "http_requests_per_second"
+        metricsQuery: 'sum(rate(<<.Series>>{<<.LabelMatchers>>}[2m])) by (service_name) or (sum(<<.Series>>{<<.LabelMatchers>>} * 0) by (service_name))'
+      # Alternate HTTP duration naming (seconds unit)
+      - seriesQuery: 'http_server_request_duration_seconds_count{service_name!=""}'
+        resources:
+          namespaced: false
+        name:
+          matches: ".*"
+          as: "http_requests_per_second"
+        metricsQuery: 'sum(rate(<<.Series>>{<<.LabelMatchers>>}[2m])) by (service_name) or (sum(<<.Series>>{<<.LabelMatchers>>} * 0) by (service_name))'
+      # Alternate HTTP duration naming (seconds unit) or spanmetrics fallback
+      - seriesQuery: 'traces_span_metrics_calls_total{service_name!=""}'
+        resources:
+          namespaced: false
+        name:
+          matches: ".*"
+          as: "http_requests_per_second"
+        metricsQuery: 'sum(rate(<<.Series>>{<<.LabelMatchers>>}[2m])) by (service_name) or (sum(<<.Series>>{<<.LabelMatchers>>} * 0) by (service_name))'
+  resources:
+    # kubectl top: 9m CPU, 38Mi mem. P99 mem: 45.1Mi. External metrics API for RPS HPA.
+    requests:
+      cpu: 10m
+      memory: 56Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+  replicas: 1
+
+# Change trail: @hungxqt - 2026-07-19 - load-generator-worker uses imageOverride.name=load-generator (not hardcoded techx-corp path).

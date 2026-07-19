@@ -1,0 +1,444 @@
+# Production overlay for Argo CD / Helm GitOps (REL-09).
+# Layer order: values.yaml → values-public-alb.yaml → values-prod.yaml
+#
+# Image contract: default.image.repository + default.image.tag is GLOBAL for all
+# nested services including opensearch (…/techx-corp/<service>:<tag>).
+# Promotion: full bake all services → verify every ECR tag → open PR → merge → Argo sync.
+# Do not open a values-prod PR while image push is still in progress.
+#
+# Secrets (SEC-05): values.yaml uses secretKeyRef. Bootstrap ASM + deploy secrets-chart first.
+# Do not commit real production credentials into this file.
+# See docs/operations/external-secrets.md
+
+externalSecrets:
+  enabled: true
+  namespace: techx-corp-prod
+
+grafana:
+  grafana.ini:
+    server:
+      # Alert links are generated outside an HTTP request, so the base
+      # values.yaml macro can fall back to localhost. Pin prod to the private
+      # operator URL used through Client VPN / internal ALB.
+      domain: "internal.hungtran.id.vn"
+      root_url: "https://internal.hungtran.id.vn/grafana"
+      serve_from_sub_path: true
+
+default:
+  # Keep a bounded rollback window while admission policy prevents new violations.
+  revisionHistoryLimit: 2
+  # DIRECTIVE #3: stop routing first, then terminate. The native lifecycle sleep
+  # works with distroless images because it does not execute a container binary.
+  terminationGracePeriodSeconds: 30
+  preStopSleepSeconds: 10
+  image:
+    repository: 493499579600.dkr.ecr.us-east-1.amazonaws.com/techx-prod-corp
+    # Replace with currently running tag before cutover (e.g. sha-a1b2c3d or v1.2.3).
+    tag: "sha-bd3c049"
+  # Production replicas must occupy distinct hosts and, where capacity exists,
+  # both configured AZs. minDomains=2 prevents a one-zone placement from being
+  # treated as balanced. Karpenter can add the missing stateless capacity.
+  schedulingRules:
+    topologySpreadConstraints:
+      - maxSkew: 1
+        minDomains: 2
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: DoNotSchedule
+      - maxSkew: 1
+        minDomains: 2
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: DoNotSchedule
+
+
+mem0:
+  # TEMPORARY: disable Mem0 workload (Deployment/Job/SA). Re-enable when ready.
+  # secrets-chart Mem0 ExternalSecrets stay enabled (overlay unchanged).
+  enabled: false
+  awsRegion: us-east-1
+  # Image: inherit default.image.repository/mem0:default.image.tag (platform chart promote).
+  rds:
+    host: "techx-prod-tf2-mem0-postgres.cijoii00i7pl.us-east-1.rds.amazonaws.com"
+    port: 5432
+    database: mem0
+    appUser: mem0_app
+  serviceAccount:
+    name: mem0
+    roleArn: "arn:aws:iam::493499579600:role/techx-prod-tf2-mem0-model-read"
+  # K8s Secret *names* only (RFC 1123). ASM ARN/name lives in secrets-chart mem0.masterRemoteKey.
+  runtimeSecretName: techx-corp-mem0
+  masterSecretName: techx-corp-mem0-rds-master
+  modelDelivery:
+    enabled: true
+    awsRegion: us-east-1
+    # Composed as {{ s3Prefix }}/{{ default.image.tag }}/{{ archiveName }}.
+    # Set platform MEM0_FASTEMBED_ARTIFACT_S3_URI to this s3Prefix so CI publishes under the global tag.
+    s3Prefix: "s3://techx-prod-tf2-ai-models-493499579600/fastembed/paraphrase-multilingual-MiniLM-L12-v2"
+    archiveName: fastembed-paraphrase-multilingual-MiniLM-L12-v2-faf4aa422582.tar.gz
+    mountPath: /models/fastembed
+components:
+  # DIRECTIVE #3: keep at least two Ready instances for every stateless service
+  # on the synchronous browse -> cart -> checkout path. HPA services use a
+  # production floor of two; fixed-size services declare replicas explicitly.
+  # Stateful dependencies require real replication/failover and must not be
+  # made "HA" by starting independent writers against the same storage.
+  ad:
+    replicas: 2
+    schedulingRules: &directive03-hard-spread
+      topologySpreadConstraints:
+        - maxSkew: 1
+          minDomains: 2
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+        - maxSkew: 1
+          minDomains: 2
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+  cart:
+    autoscaling:
+      minReplicas: 2
+    schedulingRules: *directive03-hard-spread
+    envOverrides:
+      # Stable private DNS (Route53 CNAME → ElastiCache primary). TCP-only init
+      # proves reachability; the app must use TLS + AUTH (replication group has
+      # transit_encryption_enabled and auth_token). Without them the process
+      # hangs in StackExchange.Redis ConnectRetry and never binds :8080 →
+      # liveness connection refused / readiness timeout.
+      - name: VALKEY_ADDR
+        value: valkey-cart.techx.internal:6379
+      - name: VALKEY_TLS
+        value: "true"
+      # SslHost must match the ElastiCache certificate CN/SAN (AWS endpoint),
+      # not the private CNAME. Update if the replication group is recreated:
+      #   terraform -chdir=environments/production output -raw commerce_valkey_primary_endpoint
+      - name: VALKEY_TLS_HOST
+        value: master.techx-prod-tf2-cart.2bnsjq.use1.cache.amazonaws.com
+      - name: VALKEY_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: techx-corp-valkey-cart
+            key: VALKEY_PASSWORD
+    # Production uses the Terraform-managed Multi-AZ Valkey endpoint. Keep the
+    # bounded startup gate, but target stable private DNS instead of the removed
+    # in-cluster singleton Service.
+    initContainers:
+      - name: wait-for-managed-valkey
+        image: busybox:1.37.0
+        command: ["sh", "-c", "until nc -z -v -w5 valkey-cart.techx.internal 6379; do echo waiting for managed Valkey; sleep 2; done;"]
+  checkout:
+    autoscaling:
+      minReplicas: 2
+    schedulingRules: *directive03-hard-spread
+    serviceAccount:
+      create: true
+      name: checkout
+      annotations:
+        eks.amazonaws.com/role-arn: arn:aws:iam::493499579600:role/techx-prod-tf2-checkout-outbox
+    envOverrides:
+      - name: CHECKOUT_OUTBOX_TABLE
+        value: techx-prod-tf2-checkout-outbox
+      - name: AWS_REGION
+        value: us-east-1
+      - name: KAFKA_ADDR
+        valueFrom:
+          secretKeyRef:
+            name: techx-corp-msk
+            key: KAFKA_ADDR
+      - name: KAFKA_TLS
+        value: "true"
+      - name: KAFKA_SASL_USERNAME
+        valueFrom: &msk-sasl-username
+          secretKeyRef:
+            name: techx-corp-msk
+            key: KAFKA_SASL_USERNAME
+      - name: KAFKA_SASL_PASSWORD
+        valueFrom: &msk-sasl-password
+          secretKeyRef:
+            name: techx-corp-msk
+            key: KAFKA_SASL_PASSWORD
+    # Kafka is no longer a startup dependency. The durable outbox worker retries
+    # publication after the checkout pod is Ready.
+    initContainers: []
+  
+  accounting:
+    envOverrides:
+      - name: KAFKA_ADDR
+        valueFrom:
+          secretKeyRef:
+            name: techx-corp-msk
+            key: KAFKA_ADDR
+      - name: KAFKA_TLS
+        value: "true"
+      - name: KAFKA_SASL_USERNAME
+        valueFrom: *msk-sasl-username
+      - name: KAFKA_SASL_PASSWORD
+        valueFrom: *msk-sasl-password
+    initContainers: []
+
+  fraud-detection:
+    envOverrides:
+      - name: KAFKA_ADDR
+        valueFrom:
+          secretKeyRef:
+            name: techx-corp-msk
+            key: KAFKA_ADDR
+      - name: KAFKA_TLS
+        value: "true"
+      - name: KAFKA_SASL_USERNAME
+        valueFrom: *msk-sasl-username
+      - name: KAFKA_SASL_PASSWORD
+        valueFrom: *msk-sasl-password
+      - name: REDIS_ADDR
+        value: valkey-cart.techx.internal:6379
+      - name: VALKEY_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: techx-corp-valkey-cart
+            key: VALKEY_PASSWORD
+    initContainers: []
+
+  currency:
+    autoscaling:
+      minReplicas: 2
+    schedulingRules: *directive03-hard-spread
+  email:
+    replicas: 2
+    schedulingRules: *directive03-hard-spread
+
+  flagd:
+    # Singleton control plane on Critical MNG (system-* / workload-class=critical).
+    # Not on the Directive #3 two-replica money-path floor: load is tiny, BTC HTTP
+    # is authoritative for chaos keys, and multi-replica emptyDir splits local-* UI.
+    replicas: 1
+    # Dual sources: local ConfigMap file + BTC central HTTP.
+    # Merge order: later source wins on key clash — HTTP last so BTC always wins
+    # for shared original keys (paymentFailure, cartFailure, …).
+    # Local file / flagd-ui: local-* keys only (no BTC original names in UI).
+    # Team self-test: toggle local-* in /feature (apps OR/max with BTC keys).
+    # flagd-ui: inherit base values.yaml sidecar (writes local file only).
+    # Access: /feature via internal ALB / Client VPN (CloudFront blocks /feature).
+    # Requires ESO Secret techx-corp-flagd-ui (SECRET_KEY_BASE and FLAGD_SYNC_TOKEN).
+    envOverrides:
+      - name: FLAGD_SYNC_TOKEN
+        valueFrom:
+          secretKeyRef:
+            name: techx-corp-flagd-ui
+            key: FLAGD_SYNC_TOKEN
+    command:
+      - "/flagd-build"
+      - "start"
+      - "--port"
+      - "8013"
+      - "--ofrep-port"
+      - "8016"
+      - "--sources"
+      - '[{"uri":"/etc/flagd/demo.flagd.json","provider":"file"},{"uri":"https://122.248.223.194.sslip.io/flags.json","provider":"http","authHeader":"Bearer $(FLAGD_SYNC_TOKEN)"}]'
+    # Pin Critical MNG only; clear spreads (singleton does not need multi-host HA).
+    schedulingRules:
+      nodeSelector:
+        workload-class: critical
+      affinity: {}
+      tolerations: []
+      topologySpreadConstraints: []
+
+  frontend:
+    autoscaling:
+      # Temporary N+1 capacity for the maintenance window: draining one node
+      # leaves two frontend pods serving while the replacement becomes Ready.
+      minReplicas: 3
+      targetCPUUtilizationPercentage: 65
+      # Spanmetrics counts all frontend server spans; observed ~160-190 metric RPS
+      # at 150-200 users. Base target is 80 RPS/pod; keep prod aligned so steady
+      # load stays near minReplicas 3 instead of over-scaling on inflated RPS.
+      targetRequestsPerSecond: 80
+    schedulingRules: *directive03-hard-spread
+
+  frontend-proxy:
+    publicAlb:
+      # Internal ALB; path blocking is on CloudFront (infra cloudfront_block_sensitive_paths).
+      scheme: internal
+      blockSensitivePaths: false
+      # HTTPS for operator private DNS (https://internal.hungtran.id.vn/...).
+      # Set to the same ACM ARN as techx-corp-infra production:
+      #   private_dns_acm_certificate_arn
+      # Template enables HTTP:80 + HTTPS:443 when non-empty. Keep CloudFront on :80.
+      # Do NOT enable ssl-redirect. See techx-corp-infra docs/client-vpn.md (TLS section).
+      # certificateArn: "arn:aws:acm:us-east-1:493499579600:certificate/<ID>"
+      certificateArn: "arn:aws:acm:us-east-1:493499579600:certificate/043175b8-99f5-492f-a258-ff280e0b9a75"
+    autoscaling:
+      minReplicas: 2
+    # Preserve the critical MNG pin from values.yaml, but prefer separate AZs
+    # and hosts. Hard spread prevents both ingress replicas sharing one node/AZ.
+    schedulingRules: *directive03-hard-spread
+
+  image-provider:
+    replicas: 2
+    schedulingRules: *directive03-hard-spread
+  payment:
+    replicas: 2
+    schedulingRules: *directive03-hard-spread
+  product-catalog:
+    autoscaling:
+      minReplicas: 2
+    schedulingRules: *directive03-hard-spread
+    initContainers: []
+  product-reviews:
+    autoscaling:
+      minReplicas: 2
+    schedulingRules: *directive03-hard-spread
+    envOverrides:
+      - name: LLM_BASE_URL
+        value: https://api.groq.com/openai/v1
+      - name: LLM_MODEL
+        value: openai/gpt-oss-20b
+    serviceAccount:
+      annotations:
+        eks.amazonaws.com/role-arn: arn:aws:iam::493499579600:role/techx-prod-tf2-product-reviews-model-read
+    modelDelivery:
+      s3Uri: s3://techx-prod-tf2-ai-models-493499579600/protectai/deberta-v3-base-prompt-injection-v2/89b085cd330414d3e7d9dd787870f315957e1e9f/artifacts/c6197e30a2dd6dd6ce7488cc775c7ae3f10b21df29192c085992f75befeedc50/model.tar.gz
+    initContainers: []
+  quote:
+    autoscaling:
+      minReplicas: 2
+    schedulingRules: *directive03-hard-spread
+  recommendation:
+    autoscaling:
+      minReplicas: 2
+    schedulingRules: *directive03-hard-spread
+  shipping:
+    autoscaling:
+      minReplicas: 2
+    schedulingRules: *directive03-hard-spread
+  postgresql:
+    command:
+      - docker-entrypoint.sh
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=4
+      - -c
+      - max_wal_senders=4
+
+  # Locust distributed: keep master up while active load testing (base values idle at 0).
+  # Scale back to 0 when tests stop to save Spot capacity.
+  load-generator:
+    replicas: 1
+    # Keep shared storefront load tests running while Groq quota is constrained.
+    # The matching task is tagged in the load-generator image.
+    envOverrides:
+      - name: LOCUST_EXCLUDE_TAGS
+        value: ai
+
+  # Production cart state is provided by ElastiCache Valkey with a primary and
+  # replica in different AZs plus automatic failover. Development keeps the
+  # in-cluster singleton for cost-efficient local testing.
+  valkey-cart:
+    enabled: false
+
+  # Production Kafka state is provided by Amazon MSK in private subnets.
+  # Development keeps the in-cluster singleton for cost-efficient testing.
+  kafka:
+    enabled: false
+
+  postgresql:
+    enabled: false
+    command:
+      - docker-entrypoint.sh
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=4
+      - -c
+      - max_wal_senders=4
+    service:
+      port: 5432
+      type: LoadBalancer
+      annotations:
+        service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+        service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+
+  load-generator-worker:
+    envOverrides:
+      - name: LOCUST_EXCLUDE_TAGS
+        value: ai
+
+# Explicit production APM resource context (same as values.yaml defaults).
+# Ensures prod overlay does not inherit a future base-values drift unintentionally.
+# Arrays replace under Helm merge — keep the full attributes list.
+prometheus:
+  kube-state-metrics:
+    nodeSelector:
+      workload-class: critical
+
+grafana:
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::493499579600:role/techx-prod-tf2-grafana-athena
+
+opentelemetry-collector:
+  # Kafka observability follows MSK. Restate OpenSearch envs because Helm
+  # replaces arrays in overlays.
+  extraEnvs:
+    - name: OPENSEARCH_USERNAME
+      valueFrom:
+        secretKeyRef:
+          name: techx-corp-opensearch
+          key: username
+    - name: OPENSEARCH_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: techx-corp-opensearch
+          key: password
+    - name: KAFKA_BROKER_0
+      valueFrom:
+        secretKeyRef:
+          name: techx-corp-msk
+          key: KAFKA_BROKER_0
+    - name: KAFKA_BROKER_1
+      valueFrom:
+        secretKeyRef:
+          name: techx-corp-msk
+          key: KAFKA_BROKER_1
+    - name: KAFKA_SASL_USERNAME
+      valueFrom:
+        secretKeyRef:
+          name: techx-corp-msk
+          key: KAFKA_SASL_USERNAME
+    - name: KAFKA_SASL_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: techx-corp-msk
+          key: KAFKA_SASL_PASSWORD
+  config:
+    receivers:
+      kafkametrics:
+        brokers:
+          - ${env:KAFKA_BROKER_0}
+          - ${env:KAFKA_BROKER_1}
+        protocol_version: 3.7.0
+        auth:
+          sasl:
+            username: ${env:KAFKA_SASL_USERNAME}
+            password: ${env:KAFKA_SASL_PASSWORD}
+            mechanism: SCRAM-SHA-512
+        tls:
+          insecure: false
+    processors:
+      resource:
+        attributes:
+        - key: service.instance.id
+          from_attribute: k8s.pod.uid
+          action: insert
+        - key: deployment.environment.name
+          value: production
+          action: upsert
+        - key: service.namespace
+          value: techx-corp-prod
+          action: upsert
+
+# Change trail: @hungxqt - 2026-07-19 - Temporarily disable mem0.enabled in prod app chart only.

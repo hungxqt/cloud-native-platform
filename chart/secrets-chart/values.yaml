@@ -1,0 +1,67 @@
+# Separate release: helm upgrade --install techx-corp-secrets ./secrets-chart -n techx-corp-prod
+# Deploy AFTER ClusterSecretStore is Ready and AFTER ASM values are bootstrapped.
+# Deploy BEFORE (or wait Ready before) the main techx-corp app chart.
+# Dev: -n techx-corp-dev -f values-dev.yaml (overrides namespace).
+
+namespace: techx-corp-prod
+
+secretStore:
+  name: aws-secretsmanager
+  kind: ClusterSecretStore
+
+refreshInterval: 1h
+
+# Prefer Orphan during migration so deleting ExternalSecret does not GC the K8s Secret.
+creationPolicy: Orphan
+
+# ASM path prefix (must match Terraform secrets_manager_name_prefix)
+remoteKeyPrefix: techx-corp/production
+
+# Target K8s Secret names consumed by the app chart (secretKeyRef)
+targets:
+  postgresqlAdmin: techx-corp-postgresql-admin
+  postgresqlApp: techx-corp-postgresql-app
+  flagdUi: techx-corp-flagd-ui
+  productReviews: techx-corp-product-reviews
+  grafanaAdmin: techx-corp-grafana-admin
+  # SEC-06: OpenSearch security plugin credentials
+  opensearch: techx-corp-opensearch
+  # Directive #3: managed ElastiCache Valkey auth (prod only; see values-prod.yaml)
+  valkeyCart: techx-corp-valkey-cart
+  # Directive #8: Amazon MSK bootstrap brokers (prod only; see values-prod.yaml)
+  msk: techx-corp-msk
+  # Grafana Discord alert webhook (ESO-managed, replaces kubectl create secret)
+  grafanaDiscord: techx-corp-grafana-discord
+  # AIOps inbound Grafana webhook auth secret
+  aiopsGrafanaWebhook: techx-corp-aiops-grafana-webhook
+  # Mem0 runtime keys (Groq, JWT, API keys) and RDS master for migrate Job
+  mem0Runtime: techx-corp-mem0
+  mem0RdsMaster: techx-corp-mem0-rds-master
+
+# Managed cart Valkey auth token (Terraform commerce_ha module).
+# Dev keeps in-cluster valkey-cart without auth — leave enabled: false.
+valkeyCart:
+  enabled: false
+  # Full ASM secret name (not under remoteKeyPrefix). Example prod: techx-prod-tf2/valkey-cart
+  remoteKey: ""
+
+# Amazon MSK bootstrap brokers TLS connection string (Terraform msk module).
+# Dev keeps in-cluster kafka without auth — leave enabled: false.
+msk:
+  enabled: false
+  # Full ASM secret name (not under remoteKeyPrefix). Example prod: techx-prod-tf2/msk-bootstrap
+  remoteKey: ""
+  scramRemoteKey: ""
+
+rdsPostgresql:
+  enabled: false
+  # Full ASM secret containing endpoint metadata; credentials stay in postgresql-app.
+  remoteKey: ""
+
+# Mem0 self-hosted: runtime app secret + RDS-managed master secret for migrate.
+# remoteKey may be an ASM name or full ARN (ESO accepts both for Secrets Manager).
+mem0:
+  enabled: false
+  runtimeRemoteKey: ""
+  masterRemoteKey: ""
+# Change trail: @hungxqt - 2026-07-18 - Add optional Mem0 runtime and RDS-master ExternalSecret targets.

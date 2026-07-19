@@ -1,0 +1,69 @@
+# AppProject for production Applications: techx-corp (app chart) and
+# techx-corp-secrets (secrets-chart / ExternalSecrets).
+# Same inventory-based clusterResourceWhitelist as dev. Re-inventory after chart upgrades.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: techx-corp
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: TechX Corp application workloads (production)
+
+  sourceRepos:
+    # Actual GitHub repo name is tf2-corp-chart (local folder may still be techx-corp-chart).
+    - https://github.com/tf2-team/tf2-corp-chart.git
+    - https://github.com/tf2-team/tf2-corp-chart.git/*
+    - git@github.com:tf2-team/tf2-corp-chart.git
+    - git@github.com:tf2-team/tf2-corp-chart.git/*
+
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: techx-corp-prod
+    # metrics-server subchart installs RoleBinding metrics-server-auth-reader here.
+    - server: https://kubernetes.default.svc
+      namespace: kube-system
+
+  # Includes metrics-server APIService + RBAC from observability subcharts.
+  clusterResourceWhitelist:
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRole
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRoleBinding
+    - group: apiregistration.k8s.io
+      kind: APIService
+    - group: ""
+      kind: Namespace
+    - group: admissionregistration.k8s.io
+      kind: ValidatingAdmissionPolicy
+    - group: admissionregistration.k8s.io
+      kind: ValidatingAdmissionPolicyBinding
+
+  # Orphan ignore: kube defaults, Helm history Secrets, ESO-generated Secrets
+  # (created by ESO, not by either Application), STS PVCs, ALB TargetGroupBindings.
+  # ExternalSecret CRs are owned by Application techx-corp-secrets (still ignored
+  # here so the main app chart does not warn during dual-app ownership).
+  orphanedResources:
+    warn: true
+    ignore:
+      - kind: ConfigMap
+        name: kube-root-ca.crt
+      - kind: ServiceAccount
+        name: default
+      - kind: Secret
+        name: sh.helm.release*
+      - kind: Secret
+        name: techx-corp-*
+      - group: external-secrets.io
+        kind: ExternalSecret
+        name: techx-corp-*
+      - kind: PersistentVolumeClaim
+        name: kafka-data-kafka-0
+      - kind: PersistentVolumeClaim
+        name: postgresql-data-postgresql-0
+      - kind: PersistentVolumeClaim
+        name: valkey-cart-data-valkey-cart-0
+      - group: elbv2.k8s.aws
+        kind: TargetGroupBinding
+# Change trail: @hungxqt - 2026-07-15 - Document dual Application ownership for secrets-chart.

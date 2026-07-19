@@ -1,0 +1,37 @@
+namespace: techx-corp-prod
+remoteKeyPrefix: techx-corp/production
+
+# Terraform: module.commerce_ha → aws_secretsmanager_secret.valkey_auth
+# name = "${project_name}/valkey-cart" (project_name=techx-prod-tf2)
+valkeyCart:
+  enabled: true
+  remoteKey: techx-prod-tf2/valkey-cart
+
+# Terraform: module.msk → aws_secretsmanager_secret.msk_bootstrap
+# name = "${project_name}/msk-bootstrap" (project_name=techx-prod-tf2)
+msk:
+  enabled: true
+  remoteKey: techx-prod-tf2/msk-bootstrap
+  scramRemoteKey: AmazonMSK_techx-prod-tf2_app
+
+rdsPostgresql:
+  enabled: true
+  remoteKey: techx-prod-tf2/rds-postgresql
+
+# Mem0: runtime ASM secret (operator-bootstrapped JSON) + RDS-managed master secret.
+# ESO pulls from ASM (masterRemoteKey) into K8s Secret targets.mem0RdsMaster (techx-corp-mem0-rds-master).
+# The migrate Job must reference the K8s Secret name, never the ASM "rds!db-..." id (invalid DNS-1123).
+# Runtime keys are consumed via envFrom by the Mem0 Deployment; master keys by the migrate Job only.
+#
+# AccessDenied on GetSecretValue: ESO IRSA allows only exact ARNs from Terraform
+# (module.mem0_postgresql.master_user_secret_arn). After RDS recreate, re-apply
+# production Terraform so the policy includes this secret's full ARN, then re-sync.
+mem0:
+  enabled: true
+  runtimeRemoteKey: techx-corp/production/mem0
+  # Prefer full ARN from: terraform output mem0_postgresql_master_user_secret_arn
+  # MUST be the Mem0 instance secret (master user mem0_admin), NOT commerce
+  # techx-prod-tf2-postgresql (postgres_admin / rds!db-012e983a-...).
+  # Current Mem0 RDS: techx-prod-tf2-mem0-postgres → rds!db-380876ae-...
+  masterRemoteKey: "rds!db-380876ae-6adf-417d-8234-395538d8a904"
+# Change trail: @hungxqt - 2026-07-19 - Point Mem0 master ES at mem0 RDS secret, not commerce postgres.

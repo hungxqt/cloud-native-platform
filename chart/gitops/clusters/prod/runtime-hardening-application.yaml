@@ -1,0 +1,27 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: runtime-hardening
+  namespace: argocd
+spec:
+  project: techx-corp
+  source:
+    repoURL: https://github.com/tf2-team/tf2-corp-chart.git
+    targetRevision: main
+    # Final cluster-wide enforcement after exact system exceptions, Gatekeeper
+    # retirement, full inventory, server dry-run, and regression gates passed.
+    path: gitops/runtime-hardening/overlays/enforce-clusterwide
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: techx-corp-prod
+  syncPolicy:
+    automated:
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=false
+    retry:
+      limit: 3
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m

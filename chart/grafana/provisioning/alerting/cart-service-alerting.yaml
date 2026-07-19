@@ -1,0 +1,105 @@
+# Copyright The OpenTelemetry Authors
+# SPDX-License-Identifier: Apache-2.0
+
+---
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: techx-corp
+    folder: cart
+    interval: 1m
+    rules:
+      - uid: des78nlna99tsf
+        title: CartAddItemHighLatency
+        condition: p95_threshold
+        data:
+          - refId: p95_duration
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: webstore-metrics
+            model:
+              editorMode: code
+              expr: |-
+                histogram_quantile(
+                  0.95,
+                  sum by (deployment_environment_name, service_namespace, service_name, service_instance_id, http_route, http_request_method, le) (
+                    rate(
+                      http_server_request_duration_seconds_bucket{
+                        deployment_environment_name="production",
+                        service_namespace="techx-corp-prod",
+                        service_name="cart",
+                        http_request_method="POST",
+                        http_route="/oteldemo.CartService/AddItem"
+                      }[5m]
+                    )
+                  )
+                )
+              instant: true
+              interval: ""
+              intervalMs: 1000
+              legendFormat: __auto
+              maxDataPoints: 43200
+              range: false
+              refId: p95_duration
+          - refId: p95_threshold
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator:
+                    params:
+                      - 1
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - C
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: p95_duration
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: p95_threshold
+              type: threshold
+        dashboardUid: febljk0a32qyoa
+        panelId: 17
+        noDataState: OK
+        execErrState: Error
+        for: 1m
+        keepFiringFor: 2m
+        annotations:
+          discord_description: >-
+            Cart AddItem P95 latency is above 1s for 1m over a 5m rate window.
+          description: |-
+            The 95th percentile response time for operation {{ $labels.service_namespace
+                }}/{{ $labels.service_name }} "{{ $labels.http_request_method }} {{
+                $labels.http_route }}" has been
+                above 1 second for 1 minute on {{ $labels.service_instance_id}}. Current
+                value: {{ $values.p95_duration.Value | humanizeDuration }}.
+          impact: >-
+            Users can see slow cart updates after clicking Add to cart, which can reduce checkout conversion.
+          action: >-
+            Open the APM dashboard for service=cart and operation AddItem, then inspect Jaeger traces,
+            OpenSearch cart logs, cart pod CPU/memory, and Valkey connectivity before changing scale or limits.
+          dashboard_url: "https://internal.hungtran.id.vn/grafana/d/febljk0a32qyoa?orgId=1&var-deployment_environment_name=production&var-service_namespace=techx-corp-prod&var-service_name=cart"
+          runbook_url: "https://github.com/tf2-team/tf2-corp-chart/blob/main/docs/operations/request-metric-hpa.md"
+          logs_hint: 'service.name="cart" AND severity.text>=WARN'
+          trace_hint: 'service=cart operation=POST /oteldemo.CartService/AddItem'
+          summary: |-
+            High P95 for {{ $labels.service_namespace }}/{{ $labels.service_name }} "{{
+                $labels.http_request_method }} {{ $labels.http_route }}"
+        labels:
+          service_name: cart
+          service_namespace: techx-corp-prod
+          severity: warning
+          team: cdo03
+          domain: performance
+          environment: production
+          alert_type: latency
+        isPaused: false

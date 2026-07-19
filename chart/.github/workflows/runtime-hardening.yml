@@ -1,0 +1,64 @@
+name: Runtime hardening verification
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/runtime-hardening.yml"
+      - "Chart.yaml"
+      - "Chart.lock"
+      - "charts/**"
+      - "gitops/runtime-hardening/**"
+      - "gitops/clusters/prod/runtime-hardening-application.yaml"
+      - "gitops/clusters/prod/appproject.yaml"
+      - "scripts/audit-runtime-hardening.ps1"
+      - "scripts/verify-runtime-hardening.ps1"
+      - "templates/**"
+      - "tests/runtime-hardening/**"
+      - "values.schema.json"
+      - "values*.yaml"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/runtime-hardening.yml"
+      - "Chart.yaml"
+      - "Chart.lock"
+      - "charts/**"
+      - "gitops/runtime-hardening/**"
+      - "gitops/clusters/prod/runtime-hardening-application.yaml"
+      - "gitops/clusters/prod/appproject.yaml"
+      - "scripts/audit-runtime-hardening.ps1"
+      - "scripts/verify-runtime-hardening.ps1"
+      - "templates/**"
+      - "tests/runtime-hardening/**"
+      - "values.schema.json"
+      - "values*.yaml"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - uses: azure/setup-kubectl@v4
+      - uses: helm/kind-action@v1.14.0
+        with:
+          cluster_name: runtime-hardening
+          node_image: kindest/node:v1.35.0@sha256:452d707d4862f52530247495d180205e029056831160e22870e37e3f6c1ac31f
+      - name: Install yq
+        run: |
+          sudo wget -q https://github.com/mikefarah/yq/releases/download/v4.47.2/yq_linux_amd64 -O /usr/local/bin/yq
+          sudo chmod +x /usr/local/bin/yq
+      - name: Build chart dependencies
+        run: |
+          helm repo add opentelemetry https://open-telemetry.github.io/opentelemetry-helm-charts
+          helm repo add jaeger https://jaegertracing.github.io/helm-charts
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo add grafana https://grafana-community.github.io/helm-charts
+          helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/
+          helm dependency build .
+      - name: Verify chart schema and native admission policies
+        shell: pwsh
+        run: ./scripts/verify-runtime-hardening.ps1 -KubeContext kind-runtime-hardening

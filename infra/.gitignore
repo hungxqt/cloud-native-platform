@@ -1,0 +1,46 @@
+# Terraform
+.terraform/
+# .terraform.lock.hcl is not ignored to commit provider selections intentionally
+backend.hcl
+terraform.tfstate
+terraform.tfstate.backup
+terraform.tfstate.d/
+crash.log
+crash.*.log
+
+# Override files (dùng cho local dev, không thuộc về repo chung)
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# CLI output / plan files
+*.tfplan
+*.plan
+tfplan
+
+# OS & editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Python (load-generator, scripts)
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Node (nếu có script helper)
+node_modules/
+
+# Log files
+*.log
+
+.antigravity/
+
+client-vpn-pki
